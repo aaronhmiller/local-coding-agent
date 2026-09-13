@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# The one test that decides whether a local model is usable as an agent.
+#
+#   toolcall-check                                     # the active model
+#   toolcall-check mlx-community/gemma-4-12B-it-qat-4bit
+#   toolcall-check --no-start                          # fail instead of starting
+#   toolcall-check --timeout 900                       # allow longer (default 300s)
+#
+# Starts the server if it isn't already up, the same way agent-run does.
+#
+# Exit codes: 0 pass, 1 answered without tool_calls, 2 timed out or unusable.
+# A timeout is deliberately NOT reported as a tool-calling failure — those are
+# different problems with different fixes.
+#
+# A model that answers with tool_calls populated can drive OpenCode and Pi.
+# A model that puts the call in `content` as a string will narrate instead of
+# acting — it will tell you it is writing the file, and no file will appear.
+# Run this before you trust a new model, not after an hour of confusion.
+#
+# This matters most for aggressively quantized models: low-bit quantization
+# degrades structured output before it degrades prose, so a model can chat
+# perfectly well and still be useless inside an agent loop.
+
+set -uo pipefail
+
+# Resolve through symlinks: install.sh links bin/* into ~/.local/bin, and the
+# scripts must still find lib/ in the real repo. macOS has no portable
+# `readlink -f`, so walk the links by hand.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$LINK" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=../lib/registry.sh
+source "$REPO_ROOT/lib/registry.sh"
+
+need_jq
+
+NO_START=0
+TIMEOUT="${AGENT_TIMEOUT:-300}"
+ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-start) NO_START=1; shift ;;
+    --timeout)  TIMEOUT="$2"; shift 2 ;;
+    *)          ARG="$1"; shift ;;
+  esac
+done
+
+if [[ -n "$ARG" ]]; then
+  MODEL="$ARG"
+else
+  need_registry
+  MODEL="$(model_repo "$(active_model)")"
+fi
+
+# Start the server if it isn't up, the same way agent-run does. Requiring the
+# caller to remember a separate start step is a trap: `prefix + T` from a cold
+# machine would just fail.
+if ! server_running; then
+  if [[ $NO_START == 1 ]]; then
+    die "server not running at $(server_url) and --no-start was given"
+  fi
+  echo "server not up at $(server_url); starting it" >&2
+  need_registry
+  if ! "$HERE/agent-serve" start; then
+    echo >&2
+    echo "Could not start the server. Things worth checking:" >&2
+    echo "  agent-serve logs           what mlx_lm.server said on the way down" >&2
+    echo "  agent-model list           is the model actually downloaded?" >&2
+    echo "  command -v mlx_lm.server   installed, and on this shell's PATH?" >&2
+    echo "  lsof -nP -iTCP:$(server_port) -sTCP:LISTEN   is something else on the port?" >&2
+    exit 1
+  fi
+fi
+
+SERVING="$(running_model)"
+if [[ -n "$SERVING" && "$SERVING" != "$MODEL" ]]; then
+  echo "warning: the server is holding $SERVING, not $MODEL." >&2
+  echo "         Naming a different model makes mlx-lm load it alongside the" >&2
+  echo "         resident one, which is how 16GB machines get into trouble." >&2
+  echo "         Prefer: agent-model use <name> && agent-serve restart" >&2
+  echo >&2
+fi
+
+echo "Testing tool_calls support for: $MODEL"
+
+REQUEST=$(jq -n --arg model "$MODEL" '{
+  model: $model,
+  stream: false,
+  max_tokens: 256,
+  messages: [
+    { role: "user", content: "Write hello.txt containing '\''hi'\''. Use the write_file tool." }
+  ],
+  tools: [
+    {
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "Write text content to a file on disk",
+        parameters: {
+          type: "object",
+          properties: {
+            path:    { type: "string", description: "File path to write" },
+            content: { type: "string", description: "Text to write" }
+          },
+          required: ["path", "content"]
+        }
+      }
+    }
+  ]
+}')
+
+START=$(date +%s)
+RESPONSE=$(printf '%s' "$REQUEST" | curl -sS --max-time "$TIMEOUT" \
+  -H "Content-Type: application/json" \
+  "$(server_url)/v1/chat/completions" -d @-)
+CURL_RC=$?
+ELAPSED=$(( $(date +%s) - START ))
+
+# A timeout is NOT a tool-calling failure, and reporting it as one sends you
+# hunting for a better model when the real problem is that the machine is
+# struggling. Keep the two apart.
+if [[ $CURL_RC -ne 0 ]] || [[ -z "$RESPONSE" ]]; then
+  echo
+  if [[ $CURL_RC -eq 28 ]]; then
+    echo "TIMEOUT — no response in ${TIMEOUT}s. This says nothing about tool calls."
+  else
+    echo "NO RESPONSE — curl exited $CURL_RC after ${ELAPSED}s."
+  fi
+  cat <<EOF
+
+  The server accepted the connection but produced nothing. On 16GB with a 12B
+  model the usual cause is memory pressure: mlx_lm.server wires ~75% of RAM, and
+  once the machine starts swapping, generation slows to a crawl rather than
+  failing outright.
+
+  Check, in this order:
+    agent-serve logs                    did it log an error or OOM?
+    memory_pressure                     is the system already under pressure?
+    vm_stat | grep -i swap              swapping?
+
+  Then try:
+    close everything else (a browser is often 3-4GB on its own)
+    agent-serve restart                 fresh process, empty cache
+    toolcall-check --timeout 900        just slow, not stuck
+    a smaller model                     the honest fix if it stays slow
+
+EOF
+  exit 2
+fi
+
+if ! echo "$RESPONSE" | jq -e '.choices[0].message' >/dev/null 2>&1; then
+  echo
+  echo "UNPARSEABLE response after ${ELAPSED}s:"
+  echo "$RESPONSE" | head -20
+  exit 2
+fi
+
+echo "$RESPONSE" | jq '.choices[0].message | {content, tool_calls}'
+echo "(responded in ${ELAPSED}s)"
+
+if echo "$RESPONSE" | jq -e '.choices[0].message.tool_calls | length > 0' >/dev/null 2>&1; then
+  echo
+  echo "PASS — real tool_calls. This model can drive OpenCode and Pi."
+  if [[ $ELAPSED -gt 60 ]]; then
+    echo
+    echo "NOTE: ${ELAPSED}s for a trivial prompt is slow. It will be worse with a"
+    echo "      real conversation. Check memory pressure before relying on this."
+  fi
+else
+  echo
+  echo "FAIL — the model answered, but with no tool_calls. It will narrate, not act."
+  echo "       Try a higher-precision quant (8bit over 4bit), or another model."
+  exit 1
+fi

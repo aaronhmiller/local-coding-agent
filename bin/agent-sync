@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Regenerate both agent configs from models/registry.json.
+#
+# The registry is the single source of truth. opencode.json and pi/models.json
+# are build artifacts — edit the registry and re-run this, never the other way
+# round, or your next sync silently discards the hand edit.
+#
+#   agent-sync            # regenerate both configs
+#   agent-sync --print    # show what would be written, write nothing
+#
+# ONLY THE ACTIVE MODEL IS EMITTED. This is deliberate, and a change from the
+# Ollama version. mlx_lm.server will happily load a different model if a request
+# names one, but on 16GB that means a second set of weights arriving while the
+# first is still resident. Offering the agent a menu it can hurt you with is a
+# bad trade, so switching models goes through: agent-model use X && agent-serve
+# restart.
+
+set -euo pipefail
+
+# Resolve through symlinks: install.sh links bin/* into ~/.local/bin, and the
+# scripts must still find lib/ in the real repo. macOS has no portable
+# `readlink -f`, so walk the links by hand.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$LINK" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=../lib/registry.sh
+source "$REPO_ROOT/lib/registry.sh"
+
+need_registry
+
+PRINT=0
+[[ "${1:-}" == "--print" ]] && PRINT=1
+
+ACTIVE="$(active_model)"
+model_exists "$ACTIVE" || die "active model '$ACTIVE' is not in the registry"
+
+BASE_URL="$(server_url)/v1"
+
+OPENCODE_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseURL "$BASE_URL" '
+  ($r[0]) as $reg | ($reg.models[$n]) as $m |
+  {
+    "$schema": "https://opencode.ai/config.json",
+    model: "mlx/\($m.repo)",
+    provider: {
+      mlx: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "mlx-lm (local)",
+        options: { baseURL: $baseURL, apiKey: "mlx" },
+        models: {
+          ($m.repo): {
+            name: ($m.label // $n),
+            limit: {
+              context: ($m.context // 32768),
+              output: ($m.maxTokens // 8192)
+            }
+          }
+        }
+      }
+    }
+  }
+')"
+
+PI_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseUrl "$BASE_URL" '
+  ($r[0]) as $reg | ($reg.models[$n]) as $m |
+  {
+    providers: {
+      mlx: {
+        baseUrl: $baseUrl,
+        api: "openai-completions",
+        apiKey: "mlx",
+        compat: {
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false
+        },
+        models: [
+          {
+            id: $m.repo,
+            name: ($m.label // $n),
+            reasoning: ($m.reasoning // false),
+            input: ["text"],
+            contextWindow: ($m.context // 32768),
+            maxTokens: ($m.maxTokens // 8192),
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+          }
+        ]
+      }
+    }
+  }
+')"
+
+if [[ $PRINT == 1 ]]; then
+  echo "--- config/opencode/opencode.json"
+  echo "$OPENCODE_JSON"
+  echo "--- config/pi/models.json"
+  echo "$PI_JSON"
+  exit 0
+fi
+
+printf '%s\n' "$OPENCODE_JSON" | write_json "$REPO_ROOT/config/opencode/opencode.json"
+printf '%s\n' "$PI_JSON"       | write_json "$REPO_ROOT/config/pi/models.json"
+
+echo "synced: $ACTIVE ($(model_repo "$ACTIVE")) at $BASE_URL"
+
+if server_running && [[ "$(running_model)" != "$(model_repo "$ACTIVE")" ]]; then
+  echo "note: the running server still holds $(running_model) — agent-serve restart"
+fi

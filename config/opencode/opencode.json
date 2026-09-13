@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "mlx/mlx-community/Qwen3-8B-4bit",
+  "provider": {
+    "mlx": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "mlx-lm (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "mlx"
+      },
+      "models": {
+        "mlx-community/Qwen3-8B-4bit": {
+          "name": "Qwen3 8B (MLX 4-bit)",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}

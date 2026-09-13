@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Manage the local model registry.
+#
+#   agent-model list                     what's registered, what's pulled
+#   agent-model show [name]              full detail for one model
+#   agent-model add <name> --hf <repo>:<quant> [opts]
+#   agent-model add <name> --ollama <tag> [opts]
+#   agent-model use <name>               make it the default, resync configs
+#   agent-model pull [name]              download + build the ctx-tuned tag
+#   agent-model test [name]              tool_calls check
+#   agent-model remove <name>            drop from registry (keeps blobs)
+#
+# add options:
+#   --context N     token window        (default: registry defaults.context)
+#   --max-tokens N  output cap          (default: registry defaults.maxTokens)
+#   --label "..."   human-readable name
+#   --size N        GB on disk, for the list table
+#   --note "..."    anything future-you should know
+#   --no-reasoning  model has no thinking mode
+#
+# Adding from Hugging Face, end to end:
+#   agent-model add qwen-next --hf unsloth/Qwen3-Coder-GGUF:UD-Q4_K_XL --size 17
+#   agent-model pull qwen-next
+#   agent-model test qwen-next
+#   agent-model use  qwen-next
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=../lib/registry.sh
+source "$REPO_ROOT/lib/registry.sh"
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# Update the registry through a temp file so a failed jq can't truncate it.
+registry_update() {
+  local tmp
+  tmp="$(mktemp)"
+  jq "$@" "$REGISTRY" > "$tmp" || { rm -f "$tmp"; die "registry update failed"; }
+  jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "registry update produced invalid JSON"; }
+  mv "$tmp" "$REGISTRY"
+}
+
+cmd_list() {
+  need_registry
+  local active
+  active="$(active_model)"
+  printf '%-18s %-9s %-8s %-7s %s\n' NAME SOURCE CONTEXT SIZE STATUS
+  jq -r '.models | to_entries[] | [
+      .key,
+      (.value.source // "ollama"),
+      "\(((.value.context // 32768) / 1024 | floor))k",
+      (if .value.sizeGb then "\(.value.sizeGb)G" else "-" end)
+    ] | @tsv' "$REGISTRY" |
+  while IFS=$'\t' read -r name source ctx size; do
+    local tag status="not pulled"
+    tag="$(runtime_tag "$name")"
+    if ollama_up && ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$tag"; then
+      status="ready"
+    fi
+    [[ "$name" == "$active" ]] && status="$status  <- active"
+    printf '%-18s %-9s %-8s %-7s %s\n' "$name" "$source" "$ctx" "$size" "$status"
+  done
+}
+
+cmd_show() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+  echo "name:        $name"
+  echo "runtime tag: $(runtime_tag "$name")"
+  jq -r --arg n "$name" '.models[$n] | to_entries[] | "\(.key + ":" | . + (" " * (12 - length)))\(.value)"' "$REGISTRY"
+}
+
+cmd_add() {
+  need_registry
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "add needs a name"
+  ! model_exists "$name" || die "$name already exists (use 'remove' first)"
+  [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die "name must be alphanumeric plus . _ -"
+
+  local base="" source="" label="" note="" size="null" reasoning=true
+  local context maxtokens
+  context="$(jq -r '.defaults.context // 32768' "$REGISTRY")"
+  maxtokens="$(jq -r '.defaults.maxTokens // 8192' "$REGISTRY")"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hf)           base="hf.co/$2"; source="hf";     shift 2 ;;
+      --ollama)       base="$2";       source="ollama"; shift 2 ;;
+      --context)      context="$2";                     shift 2 ;;
+      --max-tokens)   maxtokens="$2";                   shift 2 ;;
+      --label)        label="$2";                       shift 2 ;;
+      --size)         size="$2";                        shift 2 ;;
+      --note)         note="$2";                        shift 2 ;;
+      --no-reasoning) reasoning=false;                  shift   ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$base" ]] || die "add needs --hf <repo>:<quant> or --ollama <tag>"
+  [[ "$context" =~ ^[0-9]+$ ]] || die "--context must be a number"
+  [[ "$maxtokens" =~ ^[0-9]+$ ]] || die "--max-tokens must be a number"
+  (( context % 1024 == 0 )) || die "--context must be a multiple of 1024 (tag naming depends on it)"
+  [[ -n "$label" ]] || label="$name"
+
+  # NB: the jq variable is $lbl, not $label — `label` is a jq keyword (used by
+  # `label $out | ... | break $out`), so `--arg label` produces a parse error.
+  registry_update \
+    --arg n "$name" --arg base "$base" --arg source "$source" \
+    --arg lbl "$label" --arg note "$note" \
+    --argjson ctx "$context" --argjson max "$maxtokens" \
+    --argjson size "$size" --argjson reasoning "$reasoning" '
+    .models[$n] = {
+      "source": $source, "base": $base, "label": $lbl,
+      "context": $ctx, "maxTokens": $max,
+      "reasoning": $reasoning, "sizeGb": $size, "note": $note
+    }'
+
+  echo "added $name -> $base"
+  "$HERE/agent-sync"
+  echo "next: agent-model pull $name && agent-model test $name"
+}
+
+cmd_use() {
+  need_registry
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "use needs a name"
+  model_exists "$name" || die "unknown model: $name"
+  registry_update --arg n "$name" '.active = $n'
+  echo "active model is now $name ($(runtime_tag "$name"))"
+  "$HERE/agent-sync"
+}
+
+cmd_pull() {
+  need_registry
+  require_ollama
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+
+  local base tag context
+  base="$(model_field "$name" base)"
+  context="$(model_field "$name" context)"
+  tag="$(runtime_tag "$name")"
+
+  echo "pulling $base"
+  ollama pull "$base"
+
+  # Ollama defaults every model to a 4096-token window, far too small for an
+  # agent that reads files. Re-tag with the real window; this reuses the same
+  # blobs, so it costs no extra disk.
+  local modelfile
+  modelfile="$(mktemp)"
+  printf 'FROM %s\nPARAMETER num_ctx %s\n' "$base" "$context" > "$modelfile"
+  echo "creating $tag at ${context} tokens"
+  ollama create "$tag" -f "$modelfile"
+  rm -f "$modelfile"
+
+  echo "done. verify it can actually act: agent-model test $name"
+}
+
+cmd_test() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+  exec "$HERE/toolcall-check" "$(runtime_tag "$name")"
+}
+
+cmd_remove() {
+  need_registry
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "remove needs a name"
+  model_exists "$name" || die "unknown model: $name"
+  [[ "$name" != "$(active_model)" ]] || die "$name is active; 'use' another model first"
+  registry_update --arg n "$name" 'del(.models[$n])'
+  echo "removed $name from the registry (Ollama blobs untouched: ollama rm $(echo "$name"):ctx*)"
+  "$HERE/agent-sync"
+}
+
+case "${1:-list}" in
+  list)   shift || true; cmd_list "$@" ;;
+  show)   shift; cmd_show "$@" ;;
+  add)    shift; cmd_add "$@" ;;
+  use)    shift; cmd_use "$@" ;;
+  pull)   shift; cmd_pull "$@" ;;
+  test)   shift; cmd_test "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "unknown command: $1" >&2; usage 1 ;;
+esac

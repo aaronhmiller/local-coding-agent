@@ -1,0 +1,574 @@
+#!/usr/bin/env bash
+# Manage the mlx_lm.server process.
+#
+#   agent-serve start [name]   start on a model (default: the active one)
+#   agent-serve stop
+#   agent-serve restart [name]
+#   agent-serve status
+#   agent-serve logs [-f] [--prev]   current run's log (or the previous one)
+#   agent-serve doctor         diagnose install/PATH/model/port problems
+#   agent-serve setup-python [venv] [--python P] [--recreate]
+#                              build a venv with mlx-lm on a modern Python
+#
+# Unlike Ollama, mlx-lm is not a background daemon that manages itself — it's a
+# server you start, holding one model resident. This script is the piece that
+# difference forces.
+#
+# MEMORY, AND WHY --prompt-cache-bytes IS NOT OPTIONAL
+#
+# mlx_lm.server wires ~75% of RAM on startup (mx.set_wired_limit). Wired memory
+# cannot be swapped, so macOS cannot reclaim it under pressure. Combined with a
+# KV cache that grew without bound, this produced real kernel panics during
+# agentic coding sessions — ml-explore/mlx-lm#883 is precisely this setup:
+# mlx_lm.server + OpenCode + context growing past ~58k tokens, ending in a
+# forced reboot rather than a killed process.
+#
+# The fix (PR #906) added --prompt-cache-bytes. The PyPI release lags the repo,
+# so this script probes --help and passes the flag only when it exists, warning
+# loudly when it does not.
+# Related rough edges are still open upstream: #854 (OOM crashes the server
+# instead of returning HTTP 500) and #1118 (the flag may not be honored in
+# sequential serve mode). So treat the cap as a seatbelt, not a guarantee:
+# restart the server between long sessions, and keep the context modest.
+
+set -euo pipefail
+
+# Resolve through symlinks: install.sh links bin/* into ~/.local/bin, and the
+# scripts must still find lib/ in the real repo. macOS has no portable
+# `readlink -f`, so walk the links by hand.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$LINK" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=../lib/registry.sh
+source "$REPO_ROOT/lib/registry.sh"
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+PYTHON="$(agent_python)"
+
+# mlx-lm installs `mlx_lm.server` as a console script, but that lands in the
+# bin/ of whichever Python did the install — a venv, a --user dir, Homebrew's
+# Python. If that bin/ isn't on PATH, the command vanishes while the package is
+# perfectly importable. Falling back to `python -m` makes the common case work
+# instead of sending you PATH-hunting.
+SERVER_CMD=()
+resolve_server_cmd() {
+  if command -v mlx_lm.server >/dev/null 2>&1; then
+    SERVER_CMD=(mlx_lm.server)
+  elif "$PYTHON" -c 'import mlx_lm' >/dev/null 2>&1; then
+    # `python -m mlx_lm.server` is deprecated upstream in favour of the
+    # dispatcher form `python -m mlx_lm server`. Use the supported one.
+    SERVER_CMD=("$PYTHON" -m mlx_lm server)
+    echo "note: using '$PYTHON -m mlx_lm server' (console script not on PATH)" >&2
+  else
+    return 1
+  fi
+}
+
+# mlx_lm.server's flags differ between releases, and the PyPI release lags the
+# repo. Ask the binary what it accepts instead of assuming — passing an unknown
+# flag makes argparse exit before the server ever starts.
+SERVER_HELP=""
+server_help() {
+  [[ -n "$SERVER_HELP" ]] || SERVER_HELP="$("${SERVER_CMD[@]}" --help 2>&1 || true)"
+  printf '%s' "$SERVER_HELP"
+}
+
+server_supports() {
+  server_help | grep -q -- "$1"
+}
+
+# Turn the common startup tracebacks into something actionable. Read the log
+# rather than guessing: these are the failures this setup actually produces.
+diagnose_startup_failure() {
+  local log
+  log="$(tail -n 40 "$LOG_FILE" 2>/dev/null || true)"
+  echo >&2
+
+  if grep -qi 'not supported' <<<"$log" && grep -qi 'model type' <<<"$log"; then
+    cat >&2 <<DIAG
+  DIAGNOSIS: mlx-lm cannot load this model's architecture.
+
+  mlx-lm (Python $(py_version "$PYTHON"), version $(mlx_lm_version "$PYTHON")) has no
+  module for this model_type. Two causes, in order of likelihood:
+
+  1. The model is MULTIMODAL. mlx-lm is text-only; vision/audio models need
+     mlx-vlm. Anything named *_unified, *-vl, *-vision is in that category, and
+     no amount of upgrading will help — pick a text-only model:
+       agent-model use qwen3-8b && agent-serve restart
+
+  2. mlx-lm is too old. Usually a venv built on an old Python: macOS ships 3.9
+     with the Xcode Command Line Tools, and pip then resolves an ancient mlx-lm.
+     Needs Python >= $PY_MIN_MAJOR.$PY_MIN_MINOR.
+       brew install python@3.12
+       agent-serve setup-python --recreate
+
+  (Reaching this message at all is odd — agent-serve preflights the architecture
+  before starting, so the config may have changed underneath it.)
+
+DIAG
+  elif grep -q "No module named 'mlx'" <<<"$log"; then
+    cat >&2 <<'DIAG'
+  DIAGNOSIS: mlx itself is missing. mlx-lm installs on any platform but mlx is
+  Apple-silicon only, so this machine cannot run this setup at all.
+
+DIAG
+  elif grep -qi 'address already in use' <<<"$log"; then
+    cat >&2 <<DIAG
+  DIAGNOSIS: port $(server_port) is taken. See what holds it:
+    lsof -nP -iTCP:$(server_port) -sTCP:LISTEN
+  Then change it in models/registry.json under server.port.
+
+DIAG
+  elif grep -qi 'unrecognized arguments' <<<"$log"; then
+    cat >&2 <<'DIAG'
+  DIAGNOSIS: a flag this mlx-lm does not accept. agent-serve probes --help, so
+  this most likely came from server.extraArgs in models/registry.json.
+
+DIAG
+  else
+    echo "  Run 'agent-serve doctor' for a full check of the install." >&2
+    echo >&2
+  fi
+}
+
+server_pid() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+cmd_start() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+
+  if server_running; then
+    echo "already running on $(running_model) at $(server_url)"
+    echo "to change model: agent-serve restart $name"
+    return 0
+  fi
+
+  resolve_server_cmd || die "mlx-lm is not installed for $PYTHON.
+  Diagnose:  agent-serve doctor
+  Set up a venv (the usual fix on macOS):  agent-serve setup-python"
+
+  local repo port host cache_bytes
+  repo="$(model_repo "$name")"
+  host="$(server_host)"; port="$(server_port)"
+  cache_bytes="$(jq -er '.server.promptCacheBytes // 2147483648' "$REGISTRY")"
+
+  model_cached "$repo" || die "$repo is not downloaded. Run: agent-model pull $name"
+
+  # Preflight the architecture. mlx_lm.server would otherwise start, answer
+  # /v1/models, and only fail inside a worker thread on the first real request —
+  # producing a silent timeout rather than an error.
+  local arch status
+  arch="$(model_arch_check "$PYTHON" "$repo")"
+  status="${arch##* }"; arch="${arch%% *}"
+  if [[ "$status" == "unsupported" ]]; then
+    die "this mlx-lm cannot load $repo.
+
+  config.json declares model_type '$arch', and there is no
+  mlx_lm/models/$arch.py in your install.
+
+  Usually this means the repo is MULTIMODAL. mlx-lm is text-only; vision and
+  audio models need mlx-vlm instead. Anything named *_unified, *-vl, *-vision
+  is likely in that category.
+
+  Pick a text-only model whose model_type mlx-lm implements, e.g.:
+    agent-model add qwen3-8b --repo mlx-community/Qwen3-8B-4bit --size 4.5
+    agent-model pull qwen3-8b && agent-model use qwen3-8b && agent-serve start
+
+  To check any repo before downloading it, open its config.json on Hugging Face
+  and compare model_type against:
+    ls \$($PYTHON -c 'import mlx_lm,os;print(os.path.dirname(mlx_lm.__file__))')/models"
+  fi
+
+  # Read extraArgs without `mapfile` — macOS still ships bash 3.2, and this
+  # script has to work on a stock Mac with no Homebrew bash.
+  extra=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && extra+=("$line")
+  done < <(jq -r '.server.extraArgs[]? // empty' "$REGISTRY")
+
+  mkdir -p "$RUN_DIR"
+
+  # Start a FRESH log for each run, keeping the last one as .prev.
+  #
+  # An append-only log is actively misleading here: `agent-serve logs` would tail
+  # a traceback from a run three fixes ago and you would debug a problem you had
+  # already solved. One run, one log.
+  [[ -f "$LOG_FILE" ]] && mv -f "$LOG_FILE" "$LOG_FILE.prev"
+  {
+    echo "=== agent-serve start $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "=== model: $repo"
+    echo "=== python: $PYTHON ($(py_version "$PYTHON")), mlx-lm $(mlx_lm_version "$PYTHON")"
+  } > "$LOG_FILE"
+
+  local args=(--model "$repo" --host "$host" --port "$port")
+
+  if server_supports '--prompt-cache-bytes'; then
+    args+=(--prompt-cache-bytes "$cache_bytes")
+    echo "starting mlx_lm.server on $repo"
+    echo "  $(server_url)  prompt-cache-bytes=$cache_bytes"
+  else
+    cat >&2 <<WARN
+
+  ┌─ WARNING ────────────────────────────────────────────────────────────┐
+  │ This mlx-lm has no --prompt-cache-bytes, so the KV cache is UNCAPPED. │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  That cap is the guard against ml-explore/mlx-lm#883: mlx_lm.server wires
+  ~75% of RAM, wired memory cannot be swapped, and an agentic session whose
+  context kept growing took the whole machine down with a kernel panic — a
+  forced reboot, not a killed process.
+
+  The flag is on the repo's main branch but not in your release. Either:
+
+    upgrade:   $PYTHON -m pip install -U mlx-lm
+    or main:   $PYTHON -m pip install 'mlx-lm @ git+https://github.com/ml-explore/mlx-lm'
+
+  Until then, keep sessions short, run 'agent-serve restart' between them
+  (prefix + S), keep context at 32K, and do not leave it running unattended.
+
+WARN
+    echo "starting mlx_lm.server on $repo (no KV cache cap available)"
+    echo "  $(server_url)"
+  fi
+
+  # Cap output length too where supported — it bounds how far any single
+  # response can push the cache in one go.
+  if server_supports '--max-tokens'; then
+    args+=(--max-tokens "$(jq -er --arg n "$name" '.models[$n].maxTokens // 8192' "$REGISTRY")")
+  fi
+
+  # HF_HUB_OFFLINE stops huggingface_hub from stalling on a revision check when
+  # there is no network — the whole point of this setup.
+  HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
+  nohup "${SERVER_CMD[@]}" \
+      "${args[@]}" \
+      ${extra+"${extra[@]}"} \
+      >> "$LOG_FILE" 2>&1 &
+
+  echo $! > "$PID_FILE"
+  printf '%s' "$repo" > "$MODEL_FILE"
+
+  printf 'waiting for the model to load'
+  for _ in $(seq 1 120); do
+    if server_running; then
+      echo " ready"
+      return 0
+    fi
+    if ! server_pid >/dev/null; then
+      echo
+      echo "server exited during startup. Last lines:" >&2
+      tail -n 20 "$LOG_FILE" >&2
+      diagnose_startup_failure
+      exit 1
+    fi
+    printf '.'
+    sleep 1
+  done
+  echo
+  die "timed out after 120s. Check: agent-serve logs"
+}
+
+cmd_stop() {
+  local pid
+  if pid="$(server_pid)"; then
+    echo "stopping mlx_lm.server (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      server_pid >/dev/null || break
+      sleep 0.5
+    done
+    if pid="$(server_pid)"; then
+      echo "did not exit, sending SIGKILL"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  else
+    echo "not running"
+  fi
+  rm -f "$PID_FILE" "$MODEL_FILE"
+}
+
+cmd_status() {
+  if server_running; then
+    echo "running    $(running_model)"
+    echo "url        $(server_url)"
+    echo "pid        $(server_pid || echo 'not ours')"
+    echo "log        $LOG_FILE"
+    local active active_repo
+    active="$(active_model)"; active_repo="$(model_repo "$active")"
+    if [[ "$(running_model)" != "$active_repo" ]]; then
+      echo
+      echo "NOTE: the active model in the registry is $active ($active_repo)."
+      echo "      Run 'agent-serve restart' to load it."
+    fi
+  else
+    echo "not running"
+    [[ -f "$LOG_FILE" ]] && echo "last log: $LOG_FILE"
+  fi
+}
+
+cmd_logs() {
+  local file="$LOG_FILE" follow=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f)      follow=1; shift ;;
+      --prev)  file="$LOG_FILE.prev"; shift ;;
+      *)       die "unknown option: $1 (expected -f or --prev)" ;;
+    esac
+  done
+
+  [[ -f "$file" ]] || die "no log at $file"
+
+  # Say which run this is. The header written at startup carries the timestamp
+  # and model, so a stale log is obvious instead of confusing.
+  local age
+  age="$(head -1 "$file" 2>/dev/null || true)"
+  if [[ "$age" == "=== agent-serve start"* ]]; then
+    echo "[$(basename "$file")] $age" >&2
+    if ! server_running; then
+      echo "[note] the server is NOT running now — this is the log of a past run." >&2
+    fi
+    echo >&2
+  fi
+
+  if [[ $follow == 1 ]]; then tail -f "$file"; else tail -n 60 "$file"; fi
+}
+
+# Create a venv with mlx-lm in it and record the interpreter in the registry.
+#
+# On macOS, `pip install` against Homebrew or system Python fails with
+# "externally-managed-environment" (PEP 668). A venv is the normal answer, and
+# recording its interpreter in the registry means tmux popups find it too —
+# they do not reliably inherit your shell environment.
+cmd_setup_python() {
+  need_registry
+  local venv="" base="" recreate=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --python)   base="$2"; shift 2 ;;
+      --recreate) recreate=1; shift ;;
+      *)          venv="$1"; shift ;;
+    esac
+  done
+  venv="${venv:-$HOME/.venvs/mlx-agent}"
+  local py="$venv/bin/python"
+
+  # An existing venv on too old a Python is worse than no venv: pip will have
+  # installed an mlx-lm from years ago and everything downstream misbehaves.
+  if [[ -x "$py" ]] && ! py_version_ok "$py"; then
+    echo "existing venv at $venv is Python $(py_version "$py"), too old" >&2
+    if [[ $recreate == 1 ]]; then
+      echo "removing it and starting over"
+      rm -rf "$venv"
+    else
+      die "mlx-lm needs Python >= $PY_MIN_MAJOR.$PY_MIN_MINOR.
+  Rebuild it:  agent-serve setup-python --recreate
+  Or choose:   agent-serve setup-python --python /opt/homebrew/bin/python3.12"
+    fi
+  fi
+
+  if [[ ! -x "$py" ]]; then
+    if [[ -n "$base" ]]; then
+      command -v "$base" >/dev/null 2>&1 || die "no such interpreter: $base"
+      py_version_ok "$base" || die "$base is Python $(py_version "$base"); need >= $PY_MIN_MAJOR.$PY_MIN_MINOR"
+    else
+      base="$(find_base_python)" || die "no Python >= $PY_MIN_MAJOR.$PY_MIN_MINOR found.
+  macOS ships 3.9 with the Xcode Command Line Tools and that is too old —
+  pip would silently install an ancient mlx-lm that does not know current
+  model architectures.
+  Install a modern one:  brew install python@3.12
+  Then:                  agent-serve setup-python"
+    fi
+    echo "creating venv at $venv"
+    echo "  using $base (Python $(py_version "$base"))"
+    "$base" -m venv "$venv" || die "venv creation failed"
+  else
+    echo "reusing existing venv at $venv (Python $(py_version "$py"))"
+  fi
+
+  if ! has_mlx_lm "$py"; then
+    # huggingface_hub comes along as a dependency, which is all we need —
+    # downloads go through the library, never the CLI.
+    echo "installing mlx-lm (needs a connection)"
+    "$py" -m pip install --upgrade pip >/dev/null 2>&1 || true
+    "$py" -m pip install mlx-lm \
+      || die "install failed. If this is not Apple silicon, mlx will not install."
+  fi
+
+  # mlx-lm installs happily on any platform, but its `mlx` dependency is gated
+  # to Darwin in setup.py — so on Linux or an Intel Mac the package lands and
+  # then fails to import. Show the real error rather than a vague refusal.
+  if ! has_mlx_lm "$py"; then
+    echo >&2
+    echo "mlx-lm installed but will not import from $py:" >&2
+    "$py" -c 'import mlx_lm' 2>&1 | tail -3 >&2
+    echo >&2
+    echo "If that mentions 'No module named mlx', this machine is not Apple" >&2
+    echo "silicon. mlx has no Intel Mac or Linux build, and this whole setup" >&2
+    echo "needs it. Use the Ollama-based approach instead." >&2
+    exit 1
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg p "$py" '.server.python = $p' "$REGISTRY" > "$tmp" \
+    && jq -e . "$tmp" >/dev/null \
+    || { rm -f "$tmp"; die "could not record the interpreter in the registry"; }
+  mv "$tmp" "$REGISTRY"
+
+  echo
+  echo "recorded in the registry: server.python = $py"
+  echo "  Python  $(py_version "$py")"
+  echo "  mlx-lm  $(mlx_lm_version "$py")"
+  echo
+  echo "Everything here now uses that interpreter, including tmux popups."
+  echo "Next: agent-model pull && agent-serve start"
+}
+
+# Everything you'd otherwise work out by hand at 30,000 feet with no search.
+cmd_doctor() {
+  local ok=0
+
+  echo "python"
+  local src="default (python3)"
+  [[ -n "${AGENT_PYTHON:-}" ]] && src="AGENT_PYTHON env"
+  [[ -z "${AGENT_PYTHON:-}" ]] && [[ -n "$(jq -r '.server.python // empty' "$REGISTRY" 2>/dev/null)" ]] && src="registry server.python"
+  echo "  chosen via    $src"
+  if command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "  interpreter   $(command -v "$PYTHON")"
+    if py_version_ok "$PYTHON"; then
+      echo "  version       $(py_version "$PYTHON")"
+    else
+      echo "  version       $(py_version "$PYTHON")  TOO OLD (need >= $PY_MIN_MAJOR.$PY_MIN_MINOR)"
+      echo "  -> pip will resolve an ancient mlx-lm on this, which then fails with"
+      echo "     missing CLI flags and 'Model type ... not supported'."
+      echo "     Fix: brew install python@3.12 && agent-serve setup-python --recreate"
+      ok=1
+    fi
+  else
+    echo "  interpreter   NOT FOUND ($PYTHON)"
+    echo "  -> set AGENT_PYTHON to a real interpreter, or install Python 3"
+    ok=1
+  fi
+
+  echo
+  echo "mlx-lm"
+  if "$PYTHON" -c 'import mlx_lm' >/dev/null 2>&1; then
+    echo "  importable    yes"
+    echo "  version       $(mlx_lm_version "$PYTHON")"
+    echo "  location      $("$PYTHON" -c 'import mlx_lm,os;print(os.path.dirname(mlx_lm.__file__))' 2>/dev/null)"
+  else
+    echo "  importable    NO"
+    echo "  -> agent-serve setup-python      (builds a venv; the usual macOS fix)"
+    echo "     or: $PYTHON -m pip install mlx-lm"
+    ok=1
+  fi
+
+  if "$PYTHON" -c 'import mlx' >/dev/null 2>&1; then
+    echo "  mlx core      $("$PYTHON" -c 'import mlx.core as m;print(m.__version__)' 2>/dev/null)"
+  else
+    echo "  mlx core      NO (mlx only installs on Apple silicon)"
+    ok=1
+  fi
+
+  echo
+  echo "console script"
+  local script_dir
+  script_dir="$("$PYTHON" -c 'import sysconfig;print(sysconfig.get_path("scripts"))' 2>/dev/null || echo '')"
+  echo "  expected in   ${script_dir:-unknown}"
+  if command -v mlx_lm.server >/dev/null 2>&1; then
+    echo "  on PATH       $(command -v mlx_lm.server)"
+  else
+    echo "  on PATH       NO"
+    if [[ -n "$script_dir" && -x "$script_dir/mlx_lm.server" ]]; then
+      echo "  BUT it exists at $script_dir/mlx_lm.server"
+      echo "  -> add it to PATH:  export PATH=\"$script_dir:\$PATH\""
+      echo "     (agent-serve will use '$PYTHON -m mlx_lm.server' meanwhile)"
+    else
+      echo "  and not at the expected path either"
+    fi
+  fi
+
+  echo
+  echo "hugging face"
+  if has_hf_hub "$PYTHON"; then
+    echo "  library       importable (used for downloads; the CLI is not needed)"
+  else
+    echo "  library       NO  ->  agent-serve setup-python"
+    ok=1
+  fi
+  echo "  cache         ${HF_HOME:-$HOME/.cache/huggingface}"
+
+  echo
+  echo "registry"
+  if [[ -f "$REGISTRY" ]] && jq -e . "$REGISTRY" >/dev/null 2>&1; then
+    local a r
+    a="$(active_model)"; r="$(model_repo "$a")"
+    echo "  active        $a"
+    echo "  repo          $r"
+    echo "  downloaded    $(model_cached "$r" && echo yes || echo "NO  ->  agent-model pull $a")"
+    model_cached "$r" || ok=1
+  else
+    echo "  registry      MISSING or invalid: $REGISTRY"
+    ok=1
+  fi
+
+  echo
+  echo "server flags"
+  if resolve_server_cmd 2>/dev/null; then
+    echo "  invocation    ${SERVER_CMD[*]}"
+    if server_supports '--prompt-cache-bytes'; then
+      echo "  KV cache cap  supported (--prompt-cache-bytes)"
+    else
+      echo "  KV cache cap  NOT SUPPORTED by this mlx-lm release"
+      echo "  -> the guard against the mlx-lm#883 kernel panic is missing"
+      echo "     upgrade: $PYTHON -m pip install -U mlx-lm"
+      ok=1
+    fi
+  else
+    echo "  invocation    unavailable (mlx-lm not importable)"
+  fi
+
+  echo
+  echo "server"
+  echo "  url           $(server_url)"
+  echo "  running       $(server_running && echo yes || echo no)"
+  if command -v lsof >/dev/null 2>&1; then
+    local holder
+    holder="$(lsof -nP -iTCP:"$(server_port)" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}')"
+    [[ -n "$holder" ]] && echo "  port $(server_port) held by  $holder"
+  fi
+  echo "  log           $LOG_FILE"
+
+  echo
+  if [[ $ok == 0 ]]; then
+    echo "Looks installable. Try: agent-serve start"
+  else
+    echo "Fix the NO lines above, then: agent-serve start"
+  fi
+  return $ok
+}
+
+case "${1:-status}" in
+  start)   shift || true; cmd_start "$@" ;;
+  stop)    cmd_stop ;;
+  restart) shift || true; cmd_stop; cmd_start "$@" ;;
+  status)  cmd_status ;;
+  logs)    shift || true; cmd_logs "$@" ;;
+  doctor)  cmd_doctor ;;
+  setup-python) shift || true; cmd_setup_python "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "unknown command: $1" >&2; usage 1 ;;
+esac

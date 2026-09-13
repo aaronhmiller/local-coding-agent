@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Manage the local model registry.
+#
+#   agent-model list                     what's registered, what's downloaded
+#   agent-model show [name]              full detail for one model
+#   agent-model add <name> --repo <hf-repo> [opts]
+#   agent-model use <name>               make it the default, resync configs
+#   agent-model pull [name]              download into the Hugging Face cache
+#   agent-model test [name]              tool_calls check against the server
+#   agent-model remove <name>            drop from registry (keeps the cache)
+#
+# add options:
+#   --context N     token window        (default: registry defaults.context)
+#   --max-tokens N  output cap          (default: registry defaults.maxTokens)
+#   --label "..."   human-readable name
+#   --size N        GB on disk, for the list table
+#   --note "..."    anything future-you should know
+#   --no-reasoning  model has no thinking mode
+#
+# Adding a model from Hugging Face, end to end:
+#   agent-model add glm-flash --repo mlx-community/GLM-4.7-Flash-4bit --size 15
+#   agent-model pull  glm-flash
+#   agent-model use   glm-flash
+#   agent-serve restart
+#   agent-model test  glm-flash
+#
+# The repo must be in MLX format, not GGUF — mlx-lm cannot read GGUF. Look for
+# repos under mlx-community/ or lmstudio-community/ with -MLX or -4bit/-8bit in
+# the name, and check the file sizes on the repo page rather than trusting a
+# parameter count.
+
+set -euo pipefail
+
+# Resolve through symlinks: install.sh links bin/* into ~/.local/bin, and the
+# scripts must still find lib/ in the real repo. macOS has no portable
+# `readlink -f`, so walk the links by hand.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$LINK" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=../lib/registry.sh
+source "$REPO_ROOT/lib/registry.sh"
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+registry_update() {
+  local tmp
+  tmp="$(mktemp)"
+  jq "$@" "$REGISTRY" > "$tmp" || { rm -f "$tmp"; die "registry update failed"; }
+  jq -e . "$tmp" >/dev/null || { rm -f "$tmp"; die "registry update produced invalid JSON"; }
+  mv "$tmp" "$REGISTRY"
+}
+
+cmd_list() {
+  need_registry
+  local active running
+  active="$(active_model)"
+  running="$(running_model)"
+  printf '%-18s %-42s %-7s %s\n' NAME REPO SIZE STATUS
+  jq -r '.models | to_entries[] | [
+      .key, .value.repo,
+      (if .value.sizeGb then "\(.value.sizeGb)G" else "-" end)
+    ] | @tsv' "$REGISTRY" |
+  while IFS=$'\t' read -r name repo size; do
+    local status="not pulled"
+    model_cached "$repo" && status="downloaded"
+    [[ "$repo" == "$running" ]] && status="$status, SERVING"
+    [[ "$name" == "$active" ]] && status="$status  <- active"
+    printf '%-18s %-42s %-7s %s\n' "$name" "$repo" "$size" "$status"
+  done
+}
+
+cmd_show() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+  local repo; repo="$(model_repo "$name")"
+  echo "name:        $name"
+  echo "cache:       $(hf_cache_path "$repo")"
+  echo "downloaded:  $(model_cached "$repo" && echo yes || echo no)"
+  jq -r --arg n "$name" '.models[$n] | to_entries[] | "\(.key + ":" | . + (" " * (12 - length)))\(.value)"' "$REGISTRY"
+}
+
+cmd_add() {
+  need_registry
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "add needs a name"
+  ! model_exists "$name" || die "$name already exists (use 'remove' first)"
+  [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die "name must be alphanumeric plus . _ -"
+
+  local repo="" label="" note="" size="null" reasoning=true
+  local context maxtokens
+  context="$(jq -r '.defaults.context // 32768' "$REGISTRY")"
+  maxtokens="$(jq -r '.defaults.maxTokens // 8192' "$REGISTRY")"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)         repo="$2";      shift 2 ;;
+      --context)      context="$2";   shift 2 ;;
+      --max-tokens)   maxtokens="$2"; shift 2 ;;
+      --label)        label="$2";     shift 2 ;;
+      --size)         size="$2";      shift 2 ;;
+      --note)         note="$2";      shift 2 ;;
+      --no-reasoning) reasoning=false; shift  ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$repo" ]] || die "add needs --repo <huggingface-repo>"
+  [[ "$repo" == */* ]] || die "--repo must look like org/name (got: $repo)"
+  [[ "$context" =~ ^[0-9]+$ ]] || die "--context must be a number"
+  [[ "$maxtokens" =~ ^[0-9]+$ ]] || die "--max-tokens must be a number"
+  [[ -n "$label" ]] || label="$name"
+
+  case "$repo" in
+    *GGUF*|*gguf*)
+      echo "warning: '$repo' looks like a GGUF repo. mlx-lm cannot read GGUF." >&2
+      echo "         Look for an MLX conversion instead, e.g. mlx-community/<model>-4bit" >&2
+      ;;
+  esac
+
+  # NB: the jq variable is $lbl, not $label — `label` is a jq keyword.
+  registry_update \
+    --arg n "$name" --arg repo "$repo" --arg lbl "$label" --arg note "$note" \
+    --argjson ctx "$context" --argjson max "$maxtokens" \
+    --argjson size "$size" --argjson reasoning "$reasoning" '
+    .models[$n] = {
+      "repo": $repo, "label": $lbl,
+      "context": $ctx, "maxTokens": $max,
+      "reasoning": $reasoning, "sizeGb": $size, "note": $note
+    }'
+
+  echo "added $name -> $repo"
+  echo "next: agent-model pull $name && agent-model use $name && agent-serve restart"
+}
+
+cmd_use() {
+  need_registry
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "use needs a name"
+  model_exists "$name" || die "unknown model: $name"
+  registry_update --arg n "$name" '.active = $n'
+  echo "active model is now $name ($(model_repo "$name"))"
+  "$HERE/agent-sync"
+}
+
+cmd_pull() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+  local repo py
+  repo="$(model_repo "$name")"
+
+  if model_cached "$repo"; then
+    echo "$repo is already in the cache: $(hf_cache_path "$repo")"
+    return 0
+  fi
+
+  py="$(agent_python)"
+  has_hf_hub "$py" || die "huggingface_hub is not importable from $py.
+  It ships with mlx-lm, so this usually means the interpreter is wrong.
+  Check:  agent-serve doctor
+  Fix:    agent-serve setup-python"
+
+  echo "downloading $repo via $py (needs a connection)"
+  hf_snapshot_download "$py" "$repo" || die "download failed"
+
+  model_cached "$repo" || die "download finished but the cache looks empty — check $(hf_cache_path "$repo")"
+
+  # Tell them now, not at first request. An unsupported architecture otherwise
+  # surfaces as a silent timeout minutes later.
+  local arch status
+  arch="$(model_arch_check "$py" "$repo")"
+  status="${arch##* }"; arch="${arch%% *}"
+  case "$status" in
+    ok)          echo "architecture '$arch' is supported by this mlx-lm" ;;
+    unsupported) echo
+                 echo "WARNING: downloaded, but this mlx-lm cannot load it." >&2
+                 echo "  config.json says model_type '$arch' and there is no" >&2
+                 echo "  mlx_lm/models/$arch.py. Usually that means a multimodal" >&2
+                 echo "  repo — mlx-lm is text-only; those need mlx-vlm." >&2
+                 echo "  A text-only model that works: mlx-community/Qwen3-8B-4bit" >&2
+                 exit 1 ;;
+    *)           echo "note: could not verify the architecture; agent-serve will check again" ;;
+  esac
+
+  echo "cached. Load it with: agent-model use $name && agent-serve restart"
+}
+
+cmd_test() {
+  need_registry
+  local name="${1:-$(active_model)}"
+  model_exists "$name" || die "unknown model: $name"
+  exec "$HERE/toolcall-check" "$(model_repo "$name")"
+}
+
+cmd_remove() {
+  need_registry
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "remove needs a name"
+  model_exists "$name" || die "unknown model: $name"
+  [[ "$name" != "$(active_model)" ]] || die "$name is active; 'use' another model first"
+  local repo; repo="$(model_repo "$name")"
+  registry_update --arg n "$name" 'del(.models[$n])'
+  echo "removed $name from the registry"
+  echo "weights are still cached at $(hf_cache_path "$repo") — delete by hand to reclaim the disk"
+}
+
+case "${1:-list}" in
+  list)   shift || true; cmd_list "$@" ;;
+  show)   shift; cmd_show "$@" ;;
+  add)    shift; cmd_add "$@" ;;
+  use)    shift; cmd_use "$@" ;;
+  pull)   shift; cmd_pull "$@" ;;
+  test)   shift; cmd_test "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "unknown command: $1" >&2; usage 1 ;;
+esac

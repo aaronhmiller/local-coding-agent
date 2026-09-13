@@ -1,0 +1,49 @@
+{
+  "active": "gemma4-12b-qat",
+  "defaults": {
+    "context": 32768,
+    "maxTokens": 8192
+  },
+  "models": {
+    "gemma4-12b-qat": {
+      "source": "ollama",
+      "base": "gemma4:12b-it-qat",
+      "label": "Gemma 4 12B (QAT)",
+      "context": 32768,
+      "maxTokens": 8192,
+      "reasoning": true,
+      "sizeGb": 7.2,
+      "note": "Default. Quantization-aware trained, so tool-call formatting survives 4-bit. 256K native context, trimmed to 32K here for memory."
+    },
+    "gemma4-12b-mlx": {
+      "source": "ollama",
+      "base": "gemma4:12b-mlx",
+      "label": "Gemma 4 12B (MLX)",
+      "context": 32768,
+      "maxTokens": 8192,
+      "reasoning": true,
+      "sizeGb": 7.7,
+      "note": "Same model on Apple's MLX backend. Usually faster on Apple silicon. Try it once the QAT tag works."
+    },
+    "glm47-flash-q2": {
+      "source": "hf",
+      "base": "hf.co/unsloth/GLM-4.7-Flash-GGUF:UD-IQ2_XXS",
+      "label": "GLM-4.7-Flash (dynamic 2-bit)",
+      "context": 16384,
+      "maxTokens": 8192,
+      "reasoning": true,
+      "sizeGb": 10.5,
+      "note": "Higher ceiling, 2-bit damage. 30B-A3B MoE squeezed to 10.5GB by Unsloth dynamic quant. RUN toolcall-check BEFORE TRUSTING: low-bit quantization degrades structured output before it degrades prose."
+    },
+    "gemma4-e4b": {
+      "source": "ollama",
+      "base": "gemma4:e4b",
+      "label": "Gemma 4 E4B",
+      "context": 32768,
+      "maxTokens": 8192,
+      "reasoning": true,
+      "sizeGb": 9.6,
+      "note": "Middle option if 12B feels thin and you have headroom to spare."
+    }
+  }
+}
