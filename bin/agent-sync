@@ -42,8 +42,18 @@ ACTIVE="$(active_model)"
 model_exists "$ACTIVE" || die "active model '$ACTIVE' is not in the registry"
 
 BASE_URL="$(server_url)/v1"
+RUNTIME="$(server_runtime)"
 
-OPENCODE_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseURL "$BASE_URL" '
+# NB: the jq variable is $lbl — `label` is a jq keyword (`label $out | break`),
+# so `--arg label` is a parse error. Same trap as in agent-model.
+#
+# The provider KEY stays "mlx" across runtimes on purpose: it is part of the
+# model string OpenCode uses ("mlx/<repo>"), and agent-run passes that. Only the
+# human-readable NAME tracks the runtime — otherwise the agent's status line
+# claims mlx-lm while rmlx is actually serving, which is worse than no label.
+RUNTIME_LABEL="$RUNTIME (local)"
+
+OPENCODE_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseURL "$BASE_URL" --arg lbl "$RUNTIME_LABEL" '
   ($r[0]) as $reg | ($reg.models[$n]) as $m |
   {
     "$schema": "https://opencode.ai/config.json",
@@ -51,7 +61,7 @@ OPENCODE_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseURL
     provider: {
       mlx: {
         npm: "@ai-sdk/openai-compatible",
-        name: "mlx-lm (local)",
+        name: $lbl,
         options: { baseURL: $baseURL, apiKey: "mlx" },
         models: {
           ($m.repo): {
@@ -67,7 +77,7 @@ OPENCODE_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseURL
   }
 ')"
 
-PI_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseUrl "$BASE_URL" '
+PI_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseUrl "$BASE_URL" --arg rt "$RUNTIME" '
   ($r[0]) as $reg | ($reg.models[$n]) as $m |
   {
     providers: {
@@ -82,7 +92,7 @@ PI_JSON="$(jq -n --slurpfile r "$REGISTRY" --arg n "$ACTIVE" --arg baseUrl "$BAS
         models: [
           {
             id: $m.repo,
-            name: ($m.label // $n),
+            name: "\($m.label // $n) via \($rt)",
             reasoning: ($m.reasoning // false),
             input: ["text"],
             contextWindow: ($m.context // 32768),
@@ -106,7 +116,7 @@ fi
 printf '%s\n' "$OPENCODE_JSON" | write_json "$REPO_ROOT/config/opencode/opencode.json"
 printf '%s\n' "$PI_JSON"       | write_json "$REPO_ROOT/config/pi/models.json"
 
-echo "synced: $ACTIVE ($(model_repo "$ACTIVE")) at $BASE_URL"
+echo "synced: $ACTIVE ($(model_repo "$ACTIVE")) at $BASE_URL via $RUNTIME"
 
 if server_running && [[ "$(running_model)" != "$(model_repo "$ACTIVE")" ]]; then
   echo "note: the running server still holds $(running_model) — agent-serve restart"

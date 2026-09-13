@@ -43,7 +43,7 @@ elif [[ "$(running_model)" != "$REPO" ]]; then
   "$HERE/agent-serve" restart "$ACTIVE"
 fi
 
-echo "→ $AGENT on $REPO (mlx-lm, local)" >&2
+echo "→ $AGENT on $REPO ($(server_runtime), local)" >&2
 
 case "$AGENT" in
   opencode) exec opencode --model "mlx/$REPO" "$@" ;;

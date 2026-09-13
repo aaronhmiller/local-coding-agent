@@ -11,7 +11,7 @@
       "models": [
         {
           "id": "mlx-community/Qwen3-8B-4bit",
-          "name": "Qwen3 8B (MLX 4-bit)",
+          "name": "Qwen3 8B (MLX 4-bit) via rmlx",
           "reasoning": true,
           "input": [
             "text"

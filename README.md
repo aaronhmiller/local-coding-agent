@@ -1,24 +1,49 @@
 # Local coding agent in tmux
 
-OpenCode and Pi driving a local model through **mlx-lm**, in tmux popups, on a
-16GB MacBook, with no network. Modeled on Viktor Gamov's
+OpenCode and Pi driving a local model through **rMLX** (a single Rust binary,
+no Python in the serving path), in tmux popups, on a 16GB MacBook, with no
+network. mlx-lm remains a one-command fallback. Modeled on Viktor Gamov's
 [When Claude Is Offline](https://gamov.io/posts/when-claude-is-offline/),
 sized for a smaller machine and moved off Ollama onto Apple's own stack.
 
 Fire this up when you already know you're offline. There's no cloud tier and no
 fallback logic — if you have a connection, close this and use Claude Code.
 
-## Why mlx-lm
+## Why MLX, and why rMLX
 
 MLX is Apple's framework, so it uses hardware that llama.cpp (and therefore
-Ollama) doesn't touch — including the Neural Accelerators. Reported gains are
-30-60% on Apple silicon, widest on prompt processing. That's the number that
-matters for an agent: every tool-call round trip re-prefills a growing
-conversation, so time-to-first-token dominates a coding session far more than
-raw generation speed.
+Ollama) doesn't touch. That matters for an agent: every tool-call round trip
+re-prefills a growing conversation, so time-to-first-token dominates a coding
+session far more than raw generation speed.
 
-The cost is that mlx-lm is a server you run, not a daemon that runs itself.
-Hence `agent-serve`.
+The default runtime here is **[rMLX](https://github.com/Pushkinist/rMLX)** — a
+single Rust binary linking MLX's C ABI, with no Python in the serving path.
+
+Be clear-eyed about what that buys. It is **not** mainly memory: the resident
+process is model weights, and 4.5GB of Qwen3 is 4.5GB whatever language loads
+it. Nor is it mainly speed: rMLX's own benchmarks put decode competitive with
+mlx-lm and prefill at parity. What it buys is **operational**: one binary, no
+venv, no PATH, no PEP 668, no pip silently resolving an ancient release against
+an old interpreter. Every failure in this project's history was Python
+packaging, and a single binary deletes that whole category.
+
+The trade is maturity. rMLX is young and thinly staffed next to mlx-lm. So the
+runtime is a **registry field**, not a rewrite:
+
+```bash
+agent-serve runtime            # which one is active
+agent-serve runtime mlx-lm     # fall back
+agent-serve restart
+```
+
+Both serve the same OpenAI-compatible API on the same port, so the generated
+OpenCode and Pi configs are byte-identical across runtimes. Switching is a
+restart, not a reconfiguration.
+
+**Python doesn't disappear entirely, and it would be dishonest to imply it
+does.** It's still used to download models (`huggingface_hub`) and to run
+`agent-chat`. Neither is in the serving path — the resident process under rMLX
+is pure Rust.
 
 ## Default model
 
@@ -26,7 +51,7 @@ Hence `agent-serve`.
 text-only, trained for tool use. `qwen3-4b` (~2.4GB) is registered as a step
 down if 8B is slow.
 
-### mlx-lm is text-only, and this will bite you
+### Architecture support differs by runtime — and it will bite you
 
 The single most important thing when picking a model: **mlx-lm can only load
 architectures it implements as `mlx_lm/models/<model_type>.py`.** Multimodal
@@ -41,9 +66,12 @@ module, so the server *starts fine*, answers `/v1/models`, and then throws
 inside a worker thread on the first real request and never replies. What you see
 is a five-minute timeout with no error.
 
-So `agent-model pull` and `agent-serve start` both read `config.json` from the
-cache and check `mlx_lm.models.<model_type>` imports, failing in about a second
-with the actual reason. To check a repo yourself before downloading it, open its
+So under the mlx-lm runtime, `agent-model pull` and `agent-serve start` read
+`config.json` from the cache and check `mlx_lm.models.<model_type>` imports,
+failing in about a second with the actual reason. That check is deliberately
+**skipped under rMLX**, which has its own architecture coverage and serves
+several multimodal families mlx-lm cannot — applying the mlx-lm test there would
+reject models that actually work. To check a repo yourself before downloading it, open its
 `config.json` on Hugging Face and compare `model_type` against:
 
 ```bash
@@ -59,7 +87,28 @@ parameter counts. GLM-4.7-Flash is ~15GB as `mlx-community/GLM-4.7-Flash-4bit` �
 out of reach here, and there's no MLX equivalent of Unsloth's dynamic 2-bit
 GGUFs to rescue it.
 
-## Read this before your first long session
+## Memory, per runtime
+
+### rMLX — `--max-ctx` is the control
+
+`agent-serve` passes `--max-ctx` from the model's `context` (32768). **This is
+not optional.** rMLX resolves it to `min(capacity, 4096)` when unset, and a 4k
+window makes an agent useless the moment it reads two files. The KV ring starts
+small and grows lazily toward the ceiling, so a large value costs nothing until
+a prompt actually needs it — and prompts above it are rejected rather than
+silently truncated. That rejection *is* the memory bound.
+
+Do not expect KV quantization to save memory here. rMLX ships the widest KV
+codec matrix of any MLX server, and its own docs are refreshingly blunt that
+this is a fidelity/throughput feature, not a memory one: "no KV codec in the
+tree currently holds fewer resident bytes than plain bf16." So the runtime runs
+bf16 KV and bounds memory with `--max-ctx`. (I speculated the opposite before
+reading the docs; the docs win.)
+
+`--max-loaded-models 1` is passed explicitly too — rMLX can hold several models
+resident, which on 16GB is not a feature you want by accident.
+
+### mlx-lm — the kernel panic story
 
 `mlx_lm.server` wires ~75% of RAM at startup. Wired memory can't be swapped, so
 macOS can't reclaim it under pressure. Combined with a KV cache that grew
@@ -148,10 +197,23 @@ Apple silicon only — mlx has no Intel Mac or Linux build. Do this while you
 still have a connection.
 
 ```bash
+# rMLX runtime (default) — Apple silicon only, builds from source
+brew install mlx-c
+brew tap Pushkinist/rmlx
+brew trust Pushkinist/rmlx     # third-party taps need explicit trust
+brew install rmlx
+
 git clone <this repo> ~/src/local-coding-agent
 cd ~/src/local-coding-agent
 ./install.sh
 ```
+
+rMLX links the system MLX through `mlx-c` rather than vendoring it, so
+`brew install mlx-c` is a hard requirement. All install paths build from source
+and need Rust 1.95+.
+
+Prefer the Python runtime? `agent-serve runtime mlx-lm` before `./install.sh`,
+and the venv flow below applies instead.
 
 `install.sh` checks for mlx-lm and offers to build a venv if it's missing. Say
 yes — on macOS that's almost always the right answer, because Homebrew and
@@ -257,6 +319,24 @@ If `import mlx_lm` genuinely fails, it's an install problem, not a PATH problem
 Interpreter precedence is `AGENT_PYTHON` env → `server.python` in the registry →
 `python3`. `agent-serve doctor` prints which one it picked.
 
+## Two config files, and why
+
+| file | in git? | holds |
+|---|---|---|
+| `models/registry.json` | yes | models, context sizes, defaults — the shared setup |
+| `~/.local/state/local-coding-agent/local.json` | no | which Python, which runtime — facts about *this* machine |
+
+The split exists because it was got wrong once. The interpreter path was
+originally recorded in `models/registry.json`, so the next repo update
+overwrote it, and everything failed with an unhelpful "mlx-lm is not installed
+for python3" — pointing at bare `python3` rather than the venv that was working
+five minutes earlier.
+
+Anything `agent-serve setup-python` or `agent-serve runtime` records now goes to
+local state, which repo updates never touch. An interpreter still recorded the
+old way is migrated automatically the first time it's read. `agent-serve doctor`
+prints the local file and says which source each setting came from.
+
 ## Swapping models
 
 `models/registry.json` is the single source of truth. Both agents' configs are
@@ -337,8 +417,10 @@ ability to work at all.
 
 ```
 models/registry.json      single source of truth: models, active one, server config
-lib/registry.sh           shared helpers (repo lookup, HF cache checks, safe writes)
-bin/agent-serve           start/stop/restart/status/logs for mlx_lm.server
+lib/registry.sh           shared helpers (repo lookup, HF cache, runtime dispatch)
+lib/chat.py               the agent-chat REPL (stdlib only)
+bin/agent-serve           lifecycle for the inference server (rmlx or mlx-lm)
+bin/agent-chat            plain chat REPL against the running model
 bin/agent-model           list / show / add / pull / test / use / remove
 bin/agent-sync            regenerates both agent configs from the registry
 bin/agent-run             launches opencode|pi, starting the server if needed

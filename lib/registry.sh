@@ -7,23 +7,68 @@ RUN_DIR="${AGENT_RUN_DIR:-$HOME/.local/state/local-coding-agent}"
 PID_FILE="$RUN_DIR/mlx-server.pid"
 LOG_FILE="$RUN_DIR/mlx-server.log"
 MODEL_FILE="$RUN_DIR/mlx-server.model"
+RUNTIME_FILE="$RUN_DIR/mlx-server.runtime"
+RMLX_REGISTRY="$RUN_DIR/rmlx-models.json"
+
+# Machine-local settings, deliberately OUTSIDE the repo.
+#
+# models/registry.json is version-controlled and ships with the project, so
+# anything written into it is destroyed by the next `git pull` — which is
+# exactly what happened to a recorded interpreter path once. Facts about THIS
+# machine (which Python, which runtime is installed) live here instead; the
+# repo file carries defaults only.
+LOCAL_CONFIG="${AGENT_LOCAL_CONFIG:-$RUN_DIR/local.json}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# Which Python runs mlx-lm. Precedence: AGENT_PYTHON env > registry
-# server.python > python3. The registry entry matters because tmux popups do
-# not reliably inherit your shell environment — an interpreter recorded in a
-# file works from anywhere, an exported variable does not.
+local_get() {
+  [[ -f "$LOCAL_CONFIG" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local v
+  v="$(jq -er --arg k "$1" '.[$k] // empty' "$LOCAL_CONFIG" 2>/dev/null)" || return 1
+  [[ -n "$v" ]] && echo "$v"
+}
+
+local_set() {
+  local key="$1" value="$2" tmp
+  mkdir -p "$(dirname "$LOCAL_CONFIG")"
+  [[ -f "$LOCAL_CONFIG" ]] || echo '{}' > "$LOCAL_CONFIG"
+  tmp="$(mktemp)"
+  jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$LOCAL_CONFIG" > "$tmp" \
+    && jq -e . "$tmp" >/dev/null \
+    || { rm -f "$tmp"; die "could not write $LOCAL_CONFIG"; }
+  mv "$tmp" "$LOCAL_CONFIG"
+}
+
+# Which Python runs mlx-lm and the download helpers.
+#
+# Precedence: AGENT_PYTHON env > local.json > registry server.python (legacy,
+# still honoured so existing installs keep working) > python3.
+#
+# A recorded path matters because tmux popups do not reliably inherit your
+# shell environment — a file works from anywhere, an exported variable does not.
 agent_python() {
   if [[ -n "${AGENT_PYTHON:-}" ]]; then
     echo "$AGENT_PYTHON"
     return 0
   fi
-  local p=""
+  local p
+  if p="$(local_get python)"; then
+    echo "$p"
+    return 0
+  fi
+  p=""
   if [[ -f "$REGISTRY" ]] && command -v jq >/dev/null 2>&1; then
     p="$(jq -r '.server.python // empty' "$REGISTRY" 2>/dev/null)"
   fi
-  echo "${p:-python3}"
+  if [[ -n "$p" ]]; then
+    # Self-healing migration: an interpreter still recorded in the old place
+    # gets copied to local state, so the next repo update cannot lose it.
+    local_set python "$p" 2>/dev/null || true
+    echo "$p"
+    return 0
+  fi
+  echo "python3"
 }
 
 has_mlx_lm() {
@@ -100,12 +145,57 @@ server_host() { need_registry; jq -er '.server.host // "127.0.0.1"' "$REGISTRY";
 server_port() { need_registry; jq -er '.server.port // 8080' "$REGISTRY"; }
 server_url()  { echo "http://$(server_host):$(server_port)"; }
 
+# Which inference server backs the endpoint: "rmlx" or "mlx-lm".
+#
+# Both speak OpenAI-compatible HTTP on the same port, so the generated agent
+# configs are identical either way — the runtime is an implementation detail
+# below the API. That is what makes switching cheap.
+# Same precedence story as agent_python: whether rmlx is installed is a fact
+# about this machine, so a local choice outranks the repo's default.
+server_runtime() {
+  local r
+  if r="$(local_get runtime)"; then
+    echo "$r"
+    return 0
+  fi
+  need_registry
+  jq -er '.server.runtime // "mlx-lm"' "$REGISTRY"
+}
+
+# Absolute path of a model's snapshot directory in the HF cache.
+#
+# mlx-lm takes an HF repo id and resolves this itself; rmlx takes a directory,
+# so we have to resolve it. Same cache either way — no second download.
+model_snapshot_path() {
+  local py="$1" repo="$2"
+  HF_HUB_OFFLINE=1 "$py" - "$repo" <<'PY' 2>/dev/null
+import sys
+try:
+    from huggingface_hub import snapshot_download
+    print(snapshot_download(repo_id=sys.argv[1], local_files_only=True))
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# rmlx --registry file: {"models":[{"id":"...","path":"/abs/path"}]}
+#
+# Using --registry rather than --model is deliberate: it lets us pin the served
+# model id to the Hugging Face repo id, so the OpenCode and Pi configs are
+# byte-identical across runtimes. With --model, rmlx picks its own short name
+# and every config would have to change with the runtime.
+write_rmlx_registry() {
+  local dest="$1" id="$2" path="$3"
+  jq -n --arg id "$id" --arg path "$path" \
+    '{models: [{id: $id, path: $path}]}' | write_json "$dest"
+}
+
 server_running() {
   curl -fsS --max-time 2 -o /dev/null "$(server_url)/v1/models" 2>/dev/null
 }
 
 require_server() {
-  server_running || die "mlx_lm.server is not running. Start it with: agent-serve start"
+  server_running || die "the inference server is not running. Start it with: agent-serve start"
 }
 
 # The model the running server currently holds. Normally read from the file we

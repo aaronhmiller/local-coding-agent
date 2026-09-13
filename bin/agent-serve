@@ -7,6 +7,7 @@
 #   agent-serve status
 #   agent-serve logs [-f] [--prev]   current run's log (or the previous one)
 #   agent-serve doctor         diagnose install/PATH/model/port problems
+#   agent-serve runtime [rmlx|mlx-lm]   show or switch inference backend
 #   agent-serve setup-python [venv] [--python P] [--recreate]
 #                              build a venv with mlx-lm on a modern Python
 #
@@ -49,7 +50,7 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck source=../lib/registry.sh
 source "$REPO_ROOT/lib/registry.sh"
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 PYTHON="$(agent_python)"
 
@@ -58,8 +59,15 @@ PYTHON="$(agent_python)"
 # Python. If that bin/ isn't on PATH, the command vanishes while the package is
 # perfectly importable. Falling back to `python -m` makes the common case work
 # instead of sending you PATH-hunting.
+RUNTIME="$(server_runtime 2>/dev/null || echo mlx-lm)"
+
 SERVER_CMD=()
 resolve_server_cmd() {
+  if [[ "$RUNTIME" == "rmlx" ]]; then
+    command -v rmlx >/dev/null 2>&1 || return 1
+    SERVER_CMD=(rmlx serve)
+    return 0
+  fi
   if command -v mlx_lm.server >/dev/null 2>&1; then
     SERVER_CMD=(mlx_lm.server)
   elif "$PYTHON" -c 'import mlx_lm' >/dev/null 2>&1; then
@@ -156,9 +164,23 @@ cmd_start() {
     return 0
   fi
 
-  resolve_server_cmd || die "mlx-lm is not installed for $PYTHON.
+  if ! resolve_server_cmd; then
+    if [[ "$RUNTIME" == "rmlx" ]]; then
+      die "runtime is 'rmlx' but the rmlx binary is not on PATH.
+
+  Install (Apple silicon only):
+    brew install mlx-c                 # rmlx links the system MLX / mlx-c
+    brew tap Pushkinist/rmlx
+    brew trust Pushkinist/rmlx         # required for third-party taps
+    brew install rmlx
+
+  Or switch back:  agent-serve runtime mlx-lm
+  Diagnose:        agent-serve doctor"
+    fi
+    die "mlx-lm is not installed for $PYTHON.
   Diagnose:  agent-serve doctor
   Set up a venv (the usual fix on macOS):  agent-serve setup-python"
+  fi
 
   local repo port host cache_bytes
   repo="$(model_repo "$name")"
@@ -170,7 +192,13 @@ cmd_start() {
   # Preflight the architecture. mlx_lm.server would otherwise start, answer
   # /v1/models, and only fail inside a worker thread on the first real request —
   # producing a silent timeout rather than an error.
+  #
+  # The check asks "does mlx_lm implement this model_type", so it only speaks
+  # for the mlx-lm runtime. rmlx has its own architecture coverage (it serves
+  # multimodal families mlx-lm cannot), so applying this to rmlx would reject
+  # models that actually work. rmlx gets `rmlx info` instead, below.
   local arch status
+  if [[ "$RUNTIME" != "rmlx" ]]; then
   arch="$(model_arch_check "$PYTHON" "$repo")"
   status="${arch##* }"; arch="${arch%% *}"
   if [[ "$status" == "unsupported" ]]; then
@@ -191,6 +219,7 @@ cmd_start() {
   and compare model_type against:
     ls \$($PYTHON -c 'import mlx_lm,os;print(os.path.dirname(mlx_lm.__file__))')/models"
   fi
+  fi
 
   # Read extraArgs without `mapfile` — macOS still ships bash 3.2, and this
   # script has to work on a stock Mac with no Homebrew bash.
@@ -209,11 +238,58 @@ cmd_start() {
   [[ -f "$LOG_FILE" ]] && mv -f "$LOG_FILE" "$LOG_FILE.prev"
   {
     echo "=== agent-serve start $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "=== runtime: $RUNTIME"
     echo "=== model: $repo"
-    echo "=== python: $PYTHON ($(py_version "$PYTHON")), mlx-lm $(mlx_lm_version "$PYTHON")"
+    if [[ "$RUNTIME" == "rmlx" ]]; then
+      echo "=== rmlx: $(rmlx --version 2>/dev/null || echo '?')"
+    else
+      echo "=== python: $PYTHON ($(py_version "$PYTHON")), mlx-lm $(mlx_lm_version "$PYTHON")"
+    fi
   } > "$LOG_FILE"
 
-  local args=(--model "$repo" --host "$host" --port "$port")
+  local ctx args
+  ctx="$(jq -er --arg n "$name" '.models[$n].context // 32768' "$REGISTRY")"
+
+  if [[ "$RUNTIME" == "rmlx" ]]; then
+    local snap
+    if ! snap="$(model_snapshot_path "$PYTHON" "$repo")"; then
+      # Resolving the path needs huggingface_hub, so the usual cause is the
+      # WRONG INTERPRETER, not a missing download. Say that first — telling
+      # someone to re-download a model they already have wastes 4.5GB.
+      if ! has_hf_hub "$PYTHON"; then
+        die "cannot resolve the snapshot path: huggingface_hub is not importable
+  from $PYTHON.
+
+  The model is probably fine — this is an interpreter problem. Record the right
+  one (it reuses an existing venv):
+      agent-serve setup-python ~/.venvs/mlx-agent
+      agent-serve doctor"
+      fi
+      die "could not resolve the snapshot directory for $repo, though
+  huggingface_hub is importable. The cache may be incomplete:
+      agent-model pull $name"
+    fi
+
+    # --registry (not --model) pins the served id to the HF repo id, so the
+    # generated agent configs are identical across runtimes.
+    write_rmlx_registry "$RMLX_REGISTRY" "$repo" "$snap"
+
+    # --max-ctx is NOT optional here. rmlx resolves it to min(capacity, 4096)
+    # when unset, and a 4k window makes an agent useless the moment it reads a
+    # couple of files. The ring grows lazily to this ceiling, so a large value
+    # costs nothing until the prompt actually needs it.
+    args=(--registry "$RMLX_REGISTRY"
+          --host "$host" --port "$port"
+          --max-ctx "$ctx"
+          --max-loaded-models 1)
+
+    echo "starting rmlx serve on $repo"
+    echo "  $(server_url)  max-ctx=$ctx  (snapshot: $snap)"
+    echo "  KV cache: bf16 (rmlx's own docs are clear that no KV codec"
+    echo "            currently reduces resident bytes — --max-ctx is the"
+    echo "            control that actually bounds memory here)"
+  else
+  args=(--model "$repo" --host "$host" --port "$port")
 
   if server_supports '--prompt-cache-bytes'; then
     args+=(--prompt-cache-bytes "$cache_bytes")
@@ -249,6 +325,7 @@ WARN
   if server_supports '--max-tokens'; then
     args+=(--max-tokens "$(jq -er --arg n "$name" '.models[$n].maxTokens // 8192' "$REGISTRY")")
   fi
+  fi  # end runtime dispatch
 
   # HF_HUB_OFFLINE stops huggingface_hub from stalling on a revision check when
   # there is no network — the whole point of this setup.
@@ -260,6 +337,7 @@ WARN
 
   echo $! > "$PID_FILE"
   printf '%s' "$repo" > "$MODEL_FILE"
+  printf '%s' "$RUNTIME" > "$RUNTIME_FILE"
 
   printf 'waiting for the model to load'
   for _ in $(seq 1 120); do
@@ -284,7 +362,7 @@ WARN
 cmd_stop() {
   local pid
   if pid="$(server_pid)"; then
-    echo "stopping mlx_lm.server (pid $pid)"
+    echo "stopping $RUNTIME server (pid $pid)"
     kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do
       server_pid >/dev/null || break
@@ -297,14 +375,43 @@ cmd_stop() {
   else
     echo "not running"
   fi
-  rm -f "$PID_FILE" "$MODEL_FILE"
+  rm -f "$PID_FILE" "$MODEL_FILE" "$RUNTIME_FILE"
 }
 
 cmd_status() {
   if server_running; then
+    local pid cmdline actual="unknown"
+    pid="$(server_pid || echo '')"
+
+    # Ground truth: what the running process actually IS, read from the process
+    # table rather than from config. A label in a config file is a claim; this
+    # is evidence. Worth the extra lines — "is the status line telling me the
+    # truth?" is otherwise unanswerable without guessing.
+    if [[ -n "$pid" ]]; then
+      cmdline="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+      case "$cmdline" in
+        *rmlx*)     actual="rmlx" ;;
+        *mlx_lm*)   actual="mlx-lm" ;;
+      esac
+    fi
+    # Fall back to what we recorded at launch. Still evidence about the running
+    # process — just written by us rather than read from the process table —
+    # and far better than echoing the current config back at you.
+    if [[ "$actual" == "unknown" && -f "$RUNTIME_FILE" ]]; then
+      actual="$(cat "$RUNTIME_FILE") (recorded at launch)"
+    fi
+
     echo "running    $(running_model)"
     echo "url        $(server_url)"
-    echo "pid        $(server_pid || echo 'not ours')"
+    echo "pid        ${pid:-not ours}"
+    echo "runtime    $RUNTIME (configured)"
+    echo "process    $actual${cmdline:+  [$(echo "$cmdline" | cut -c1-70)]}"
+    if [[ "$actual" != "unknown" && "${actual%% *}" != "$RUNTIME" ]]; then
+      echo
+      echo "MISMATCH: configured runtime is '$RUNTIME' but the running process is"
+      echo "          '${actual%% *}'. The config changed since this server started."
+      echo "          Reconcile with: agent-serve restart"
+    fi
     echo "log        $LOG_FILE"
     local active active_repo
     active="$(active_model)"; active_repo="$(model_repo "$active")"
@@ -421,15 +528,13 @@ cmd_setup_python() {
     exit 1
   fi
 
-  local tmp
-  tmp="$(mktemp)"
-  jq --arg p "$py" '.server.python = $p' "$REGISTRY" > "$tmp" \
-    && jq -e . "$tmp" >/dev/null \
-    || { rm -f "$tmp"; die "could not record the interpreter in the registry"; }
-  mv "$tmp" "$REGISTRY"
+  # Recorded in local state, NOT models/registry.json. The registry ships with
+  # the repo, so anything written there is lost on the next update — which is
+  # precisely how a working interpreter path got clobbered once.
+  local_set python "$py"
 
   echo
-  echo "recorded in the registry: server.python = $py"
+  echo "recorded in $LOCAL_CONFIG: python = $py"
   echo "  Python  $(py_version "$py")"
   echo "  mlx-lm  $(mlx_lm_version "$py")"
   echo
@@ -441,10 +546,42 @@ cmd_setup_python() {
 cmd_doctor() {
   local ok=0
 
+  echo "local state"
+  echo "  file          $LOCAL_CONFIG"
+  [[ -f "$LOCAL_CONFIG" ]] && sed 's/^/                /' "$LOCAL_CONFIG" || echo "                (none yet)"
+  echo "  note          machine-specific settings live here, never in"
+  echo "                models/registry.json — that file ships with the repo"
+
+  echo
+  echo "runtime"
+  local rsrc="registry default"
+  local_get runtime >/dev/null 2>&1 && rsrc="local.json"
+  echo "  selected      $RUNTIME  (from $rsrc)"
+  if [[ "$RUNTIME" == "rmlx" ]]; then
+    if command -v rmlx >/dev/null 2>&1; then
+      echo "  rmlx          $(command -v rmlx)"
+      echo "  version       $(rmlx --version 2>/dev/null || echo '?')"
+    else
+      echo "  rmlx          NOT ON PATH"
+      echo "  -> brew install mlx-c && brew tap Pushkinist/rmlx &&"
+      echo "     brew trust Pushkinist/rmlx && brew install rmlx"
+      ok=1
+    fi
+    # rmlx links the system MLX/mlx-c rather than vendoring it.
+    if [[ -n "$(command -v brew 2>/dev/null)" ]] && brew --prefix mlx-c >/dev/null 2>&1; then
+      echo "  mlx-c         $(brew --prefix mlx-c)"
+    else
+      echo "  mlx-c         not found via brew (rmlx links the system MLX)"
+    fi
+  fi
+  echo "  note          Python is still used to DOWNLOAD models and for"
+  echo "                agent-chat — never in the serving path under rmlx."
+
+  echo
   echo "python"
   local src="default (python3)"
+  local_get python >/dev/null 2>&1 && src="local.json"
   [[ -n "${AGENT_PYTHON:-}" ]] && src="AGENT_PYTHON env"
-  [[ -z "${AGENT_PYTHON:-}" ]] && [[ -n "$(jq -r '.server.python // empty' "$REGISTRY" 2>/dev/null)" ]] && src="registry server.python"
   echo "  chosen via    $src"
   if command -v "$PYTHON" >/dev/null 2>&1; then
     echo "  interpreter   $(command -v "$PYTHON")"
@@ -527,7 +664,10 @@ cmd_doctor() {
 
   echo
   echo "server flags"
-  if resolve_server_cmd 2>/dev/null; then
+  if [[ "$RUNTIME" == "rmlx" ]]; then
+    echo "  invocation    rmlx serve --registry <generated> --max-ctx <model context>"
+    echo "  KV cache cap  via --max-ctx (rmlx docs: no KV codec reduces resident bytes)"
+  elif resolve_server_cmd 2>/dev/null; then
     echo "  invocation    ${SERVER_CMD[*]}"
     if server_supports '--prompt-cache-bytes'; then
       echo "  KV cache cap  supported (--prompt-cache-bytes)"
@@ -561,7 +701,33 @@ cmd_doctor() {
   return $ok
 }
 
+# Switch inference backend. The agent configs do not change — both runtimes
+# serve the same OpenAI-compatible API on the same port — so this is a restart,
+# not a reconfiguration.
+cmd_runtime() {
+  need_registry
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    echo "$(server_runtime)"
+    return 0
+  fi
+  case "$want" in
+    rmlx|mlx-lm) ;;
+    *) die "unknown runtime: $want (expected 'rmlx' or 'mlx-lm')" ;;
+  esac
+  # Local state, not the shipped registry — see the note in lib/registry.sh.
+  local_set runtime "$want"
+  echo "runtime is now $want  (recorded in $LOCAL_CONFIG)"
+
+  # Regenerate the agent configs so their displayed provider name matches what
+  # is actually serving. Leaving it stale means OpenCode's status line names the
+  # wrong engine, which is exactly the sort of quiet lie that wastes an hour.
+  "$HERE/agent-sync"
+  server_running && echo "restart to switch: agent-serve restart" || true
+}
+
 case "${1:-status}" in
+  runtime) shift || true; cmd_runtime "$@" ;;
   start)   shift || true; cmd_start "$@" ;;
   stop)    cmd_stop ;;
   restart) shift || true; cmd_stop; cmd_start "$@" ;;

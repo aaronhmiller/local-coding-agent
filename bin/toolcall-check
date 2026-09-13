@@ -71,9 +71,9 @@ if ! server_running; then
   if ! "$HERE/agent-serve" start; then
     echo >&2
     echo "Could not start the server. Things worth checking:" >&2
-    echo "  agent-serve logs           what mlx_lm.server said on the way down" >&2
+    echo "  agent-serve logs           what the server said on the way down" >&2
     echo "  agent-model list           is the model actually downloaded?" >&2
-    echo "  command -v mlx_lm.server   installed, and on this shell's PATH?" >&2
+    echo "  agent-serve doctor         is the runtime installed and on PATH?" >&2
     echo "  lsof -nP -iTCP:$(server_port) -sTCP:LISTEN   is something else on the port?" >&2
     exit 1
   fi
@@ -82,7 +82,7 @@ fi
 SERVING="$(running_model)"
 if [[ -n "$SERVING" && "$SERVING" != "$MODEL" ]]; then
   echo "warning: the server is holding $SERVING, not $MODEL." >&2
-  echo "         Naming a different model makes mlx-lm load it alongside the" >&2
+  echo "         Naming a different model makes the server load it alongside the" >&2
   echo "         resident one, which is how 16GB machines get into trouble." >&2
   echo "         Prefer: agent-model use <name> && agent-serve restart" >&2
   echo >&2

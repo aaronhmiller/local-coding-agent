@@ -1,11 +1,11 @@
 {
   "active": "qwen3-8b",
   "server": {
+    "runtime": "rmlx",
     "host": "127.0.0.1",
     "port": 8080,
     "promptCacheBytes": 2147483648,
-    "extraArgs": [],
-    "python": "/Users/ayayron/.venvs/mlx-agent/bin/python"
+    "extraArgs": []
   },
   "defaults": {
     "context": 32768,

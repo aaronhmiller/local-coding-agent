@@ -4,7 +4,7 @@
   "provider": {
     "mlx": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "mlx-lm (local)",
+      "name": "rmlx (local)",
       "options": {
         "baseURL": "http://127.0.0.1:8080/v1",
         "apiKey": "mlx"

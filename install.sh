@@ -31,11 +31,44 @@ REPO_ROOT="$REPO"
 # shellcheck source=lib/registry.sh
 source "$REPO/lib/registry.sh"
 PYTHON="$(agent_python)"
+RUNTIME="$(server_runtime 2>/dev/null || echo mlx-lm)"
 
+say "Inference runtime: $RUNTIME"
+
+# Python is still required even under rmlx — but only to DOWNLOAD models
+# (huggingface_hub) and for agent-chat. It is never in the serving path, so the
+# resident process is pure Rust.
+if ! "$PYTHON" -c 'import huggingface_hub' >/dev/null 2>&1; then
+  say "  note: huggingface_hub is not importable from $PYTHON."
+  say "        It is needed to download models (not to serve them)."
+fi
+
+if [[ "$RUNTIME" == "rmlx" ]]; then
+  if command -v rmlx >/dev/null 2>&1; then
+    say "  rmlx: $(command -v rmlx) ($(rmlx --version 2>/dev/null || echo '?'))"
+  else
+    say ""
+    say "  rmlx is not on PATH. Install it (Apple silicon only):"
+    say "      brew install mlx-c              # rmlx links the system MLX / mlx-c"
+    say "      brew tap Pushkinist/rmlx"
+    say "      brew trust Pushkinist/rmlx      # third-party taps need explicit trust"
+    say "      brew install rmlx"
+    say ""
+    say "  Builds from source, so expect it to take a while and to need Rust 1.95+."
+    say "  Prefer the Python runtime for now?   agent-serve runtime mlx-lm"
+    say ""
+    [[ $DRY == 1 ]] || exit 1
+  fi
+fi
+
+# Everything below is the mlx-lm runtime's Python requirement. Under rmlx we
+# still want huggingface_hub, but not mlx-lm itself.
+if [[ "$RUNTIME" == "rmlx" ]]; then
+  :
 # Check that mlx-lm is importable, not that its console script is on PATH. The
 # script lands in the bin/ of whichever Python installed it, which is often not
 # on PATH; agent-serve falls back to `python -m mlx_lm.server` in that case.
-if ! has_mlx_lm "$PYTHON"; then
+elif ! has_mlx_lm "$PYTHON"; then
   say "mlx-lm is not importable from $PYTHON."
   say ""
   say "On macOS this is usually PEP 668: Homebrew and system Python refuse"
