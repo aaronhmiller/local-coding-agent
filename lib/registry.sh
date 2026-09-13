@@ -220,10 +220,133 @@ hf_cache_path() {
   echo "$base/hub/models--${repo//\//--}"
 }
 
+# Cheap "have we started downloading this" test. Deliberately weak — see
+# model_missing_files for the one that actually decides whether it will load.
 model_cached() {
   local dir
   dir="$(hf_cache_path "$1")"
   [[ -d "$dir" ]] && [[ -n "$(ls -A "$dir/snapshots" 2>/dev/null)" ]]
+}
+
+# What a servable snapshot is missing. Empty output means complete.
+#
+# "The cache directory exists" is NOT the same as "the model will load". An
+# interrupted download, or a dangling symlink into the blobs store, leaves a
+# directory that looks populated and a model that fails at load time with
+# something like "missing chat_template.jinja or tokenizer.json". Worse, a weak
+# presence check makes `pull` report "already in the cache" and skip the repair.
+#
+# So check the files a server actually needs, and check they are READABLE and
+# non-empty — the HF cache stores snapshots as symlinks into blobs/, so a
+# broken link passes any test that only asks whether a name exists.
+model_missing_files() {
+  local py="$1" repo="$2"
+  HF_HUB_OFFLINE=1 "$py" - "$repo" <<'PY' 2>/dev/null
+import os, sys, glob
+try:
+    from huggingface_hub import snapshot_download
+    p = snapshot_download(repo_id=sys.argv[1], local_files_only=True)
+except Exception:
+    print("SNAPSHOT_UNRESOLVED"); sys.exit(0)
+
+def usable(path):
+    # Resolves symlinks; a dangling link into blobs/ fails here, which is the
+    # whole point.
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+missing = []
+if not usable(os.path.join(p, "config.json")):
+    missing.append("config.json")
+
+# Weights: either a single safetensors or a sharded set.
+if not any(usable(f) for f in glob.glob(os.path.join(p, "*.safetensors"))):
+    missing.append("*.safetensors")
+
+# Tokenizer: tokenizer.json is the modern form; tokenizer.model covers
+# sentencepiece-era repos.
+if not (usable(os.path.join(p, "tokenizer.json"))
+        or usable(os.path.join(p, "tokenizer.model"))):
+    missing.append("tokenizer.json")
+
+# Chat template: newer repos split it into chat_template.jinja, older ones
+# embed it in tokenizer_config.json. Either satisfies a server.
+if not (usable(os.path.join(p, "chat_template.jinja"))
+        or usable(os.path.join(p, "tokenizer_config.json"))):
+    missing.append("chat_template.jinja/tokenizer_config.json")
+
+print(" ".join(missing))
+PY
+}
+
+# Does this snapshot consist of symlinks? The Hugging Face cache stores every
+# snapshot file as a symlink into blobs/, which is invisible to any consumer
+# that scans a directory with a non-following file-type check.
+snapshot_is_symlinked() {
+  [[ -n "$(find "$1" -maxdepth 1 -type l -print -quit 2>/dev/null)" ]]
+}
+
+# Copy a snapshot into a directory of REAL files (cp -RL dereferences).
+#
+# Costs a second copy on disk, which is why it is not the default path — but
+# some runtimes cannot see through the HF cache's symlink farm, and a working
+# model is worth the gigabytes. Stamped with the source path so a model change
+# re-materialises and an unchanged one does not.
+materialize_snapshot() {
+  local snap="$1" dest="$2" stamp="$2/.materialized-from"
+  if [[ -f "$stamp" ]] && [[ "$(cat "$stamp" 2>/dev/null)" == "$snap" ]]; then
+    return 0
+  fi
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -RL "$snap"/. "$dest"/ || { rm -rf "$dest"; return 1; }
+  printf '%s' "$snap" > "$stamp"
+}
+
+# Write a standalone chat_template.jinja, extracted from tokenizer_config.json.
+#
+# Transformers moved chat templates into a separate chat_template.jinja file;
+# older repos (Qwen3-8B-4bit among them) still carry the template as a
+# "chat_template" string inside tokenizer_config.json. A server that only looks
+# for the standalone file finds no template and refuses to serve — which is
+# what "missing chat_template.jinja or tokenizer.json" is really saying: not
+# "these files are absent" but "I found no chat template in either place".
+#
+# Only ever called on our materialised copy, never on the Hugging Face cache.
+ensure_chat_template() {
+  local dir="$1" py="$2"
+  [[ -f "$dir/chat_template.jinja" ]] && return 0
+  [[ -f "$dir/tokenizer_config.json" ]] || return 1
+  "$py" - "$dir" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+try:
+    with open(os.path.join(d, "tokenizer_config.json")) as f:
+        tpl = json.load(f).get("chat_template")
+except Exception:
+    sys.exit(1)
+
+# Some repos ship a list of named templates instead of a bare string.
+if isinstance(tpl, list):
+    pick = None
+    for e in tpl:
+        if isinstance(e, dict) and e.get("name") == "default":
+            pick = e.get("template"); break
+    if pick is None and tpl and isinstance(tpl[0], dict):
+        pick = tpl[0].get("template")
+    tpl = pick
+
+if not isinstance(tpl, str) or not tpl.strip():
+    sys.exit(1)
+
+with open(os.path.join(d, "chat_template.jinja"), "w") as f:
+    f.write(tpl)
+PY
+}
+
+model_complete() {
+  local out
+  out="$(model_missing_files "$1" "$2")"
+  [[ -z "$out" ]]
 }
 
 # Downloads go through the huggingface_hub *library*, not its CLI.

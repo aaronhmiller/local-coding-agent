@@ -189,6 +189,26 @@ cmd_start() {
 
   model_cached "$repo" || die "$repo is not downloaded. Run: agent-model pull $name"
 
+  # A present-but-incomplete snapshot loads far enough to look fine and then
+  # fails with a missing-file error inside the server. Catch it here, where the
+  # message can name the files and the fix.
+  local missing
+  missing="$(model_missing_files "$PYTHON" "$repo")"
+  if [[ "$missing" == "SNAPSHOT_UNRESOLVED" ]]; then
+    missing=""   # handled below by the rmlx path / hf_hub check
+  elif [[ -n "$missing" ]]; then
+    die "$repo is downloaded but INCOMPLETE — missing: $missing
+
+  This is why the server reports things like
+  \"not ready (missing chat_template.jinja or tokenizer.json)\".
+  The cache directory exists; the files inside it do not.
+
+  Repair it:
+      agent-model pull $name --force
+
+  Cache: $(hf_cache_path "$repo")"
+  fi
+
   # Preflight the architecture. mlx_lm.server would otherwise start, answer
   # /v1/models, and only fail inside a worker thread on the first real request —
   # producing a silent timeout rather than an error.
@@ -268,6 +288,74 @@ cmd_start() {
       die "could not resolve the snapshot directory for $repo, though
   huggingface_hub is importable. The cache may be incomplete:
       agent-model pull $name"
+    fi
+
+    # rmlx reads the snapshot directory directly, and the HF cache fills that
+    # directory with symlinks into blobs/. A consumer that enumerates entries
+    # with a non-following file-type check sees no regular files at all, and
+    # reports exactly what we saw: "not ready (missing chat_template.jinja or
+    # tokenizer.json)" — while `rmlx info`, which opens files by name, loads the
+    # same snapshot happily.
+    #
+    # So hand rmlx a directory of real files. Costs a second copy on disk;
+    # set AGENT_NO_MATERIALIZE=1 to skip it once rmlx handles symlinks.
+    if [[ -z "${AGENT_NO_MATERIALIZE:-}" ]] && snapshot_is_symlinked "$snap"; then
+      local real="$RUN_DIR/models/${repo//\//--}"
+      if [[ ! -f "$real/.materialized-from" ]] \
+         || [[ "$(cat "$real/.materialized-from" 2>/dev/null)" != "$snap" ]]; then
+        echo "snapshot is a symlink farm (HF cache layout); materialising real files"
+        echo "  $snap"
+        echo "  -> $real   (one-time copy, uses extra disk)"
+      fi
+      materialize_snapshot "$snap" "$real" \
+        || die "could not materialise the snapshot into $real (out of disk?)"
+      snap="$real"
+    fi
+
+    # rmlx wants a standalone chat_template.jinja. Repos like Qwen3-8B-4bit
+    # keep the template inside tokenizer_config.json instead, which is why a
+    # complete, readable model still refuses to serve. Extract it into our copy.
+    if [[ ! -f "$snap/chat_template.jinja" ]]; then
+      if [[ "$snap" == "$RUN_DIR/models/"* ]]; then
+        if ensure_chat_template "$snap" "$PYTHON"; then
+          echo "extracted chat_template.jinja from tokenizer_config.json"
+        else
+          echo "warning: no chat_template.jinja and none found in tokenizer_config.json" >&2
+          echo "         rmlx may refuse to serve chat completions (503)." >&2
+        fi
+      else
+        # Never write into the Hugging Face cache — materialise first so the
+        # shim lands in a directory we own.
+        local real="$RUN_DIR/models/${repo//\//--}"
+        echo "no chat_template.jinja; materialising a copy so one can be added"
+        materialize_snapshot "$snap" "$real" \
+          || die "could not materialise the snapshot into $real (out of disk?)"
+        ensure_chat_template "$real" "$PYTHON" \
+          && echo "extracted chat_template.jinja from tokenizer_config.json" \
+          || echo "warning: no chat template found in tokenizer_config.json either" >&2
+        snap="$real"
+      fi
+    fi
+
+    # Ask rmlx itself whether it can load this snapshot, before serving it.
+    # `rmlx info` inspects architecture and quantization without starting a
+    # server, so a model rmlx cannot read fails here — with rmlx's own words —
+    # instead of becoming a 503 and a "not ready" message at first request.
+    if ! rmlx info --model "$snap" >/dev/null 2>&1; then
+      echo "rmlx cannot load this snapshot. Its own report:" >&2
+      # `|| true` matters: rmlx info exits non-zero here, and with
+      # `set -o pipefail` the failing pipeline would kill the script before the
+      # guidance below ever prints — leaving only rmlx's terse line.
+      { rmlx info --model "$snap" 2>&1 | sed 's/^/  /' >&2; } || true
+      die "rmlx rejected $repo at $snap.
+
+  Note this is rmlx's verdict, not a download problem — agent-model already
+  verified the files are present. rmlx may want a file layout this snapshot
+  does not have (a standalone chat_template.jinja, say, where this repo keeps
+  the template inside tokenizer_config.json).
+
+  Fall back to the runtime that reads this model:
+      agent-serve runtime mlx-lm && agent-serve restart"
     fi
 
     # --registry (not --model) pins the served id to the HF repo id, so the

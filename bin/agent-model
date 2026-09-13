@@ -5,7 +5,8 @@
 #   agent-model show [name]              full detail for one model
 #   agent-model add <name> --repo <hf-repo> [opts]
 #   agent-model use <name>               make it the default, resync configs
-#   agent-model pull [name]              download into the Hugging Face cache
+#   agent-model pull [name] [--force]    download into the Hugging Face cache
+#                                        (repairs an incomplete snapshot)
 #   agent-model test [name]              tool_calls check against the server
 #   agent-model remove <name>            drop from registry (keeps the cache)
 #
@@ -69,7 +70,13 @@ cmd_list() {
     ] | @tsv' "$REGISTRY" |
   while IFS=$'\t' read -r name repo size; do
     local status="not pulled"
-    model_cached "$repo" && status="downloaded"
+    if model_cached "$repo"; then
+      if model_complete "$(agent_python)" "$repo"; then
+        status="downloaded"
+      else
+        status="INCOMPLETE"
+      fi
+    fi
     [[ "$repo" == "$running" ]] && status="$status, SERVING"
     [[ "$name" == "$active" ]] && status="$status  <- active"
     printf '%-18s %-42s %-7s %s\n' "$name" "$repo" "$size" "$status"
@@ -152,17 +159,33 @@ cmd_use() {
 
 cmd_pull() {
   need_registry
-  local name="${1:-$(active_model)}"
+  local force=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *)       name="$1"; shift ;;
+    esac
+  done
+  name="${name:-$(active_model)}"
   model_exists "$name" || die "unknown model: $name"
   local repo py
   repo="$(model_repo "$name")"
+  py="$(agent_python)"
 
-  if model_cached "$repo"; then
-    echo "$repo is already in the cache: $(hf_cache_path "$repo")"
-    return 0
+  # "Already in the cache" must mean COMPLETE, not merely present. Skipping the
+  # download because a directory exists is how a half-downloaded model survives
+  # a `pull` and then fails at load time with a missing-file error.
+  if [[ $force == 0 ]] && model_cached "$repo"; then
+    local missing
+    missing="$(model_missing_files "$py" "$repo")"
+    if [[ -z "$missing" ]]; then
+      echo "$repo is already in the cache, and complete: $(hf_cache_path "$repo")"
+      return 0
+    fi
+    echo "cache exists but is INCOMPLETE — missing: $missing"
+    echo "re-downloading (this repairs partial or interrupted downloads)"
   fi
 
-  py="$(agent_python)"
   has_hf_hub "$py" || die "huggingface_hub is not importable from $py.
   It ships with mlx-lm, so this usually means the interpreter is wrong.
   Check:  agent-serve doctor
@@ -171,15 +194,35 @@ cmd_pull() {
   echo "downloading $repo via $py (needs a connection)"
   hf_snapshot_download "$py" "$repo" || die "download failed"
 
-  model_cached "$repo" || die "download finished but the cache looks empty — check $(hf_cache_path "$repo")"
+  local still
+  still="$(model_missing_files "$py" "$repo")"
+  if [[ -n "$still" ]]; then
+    die "download finished but the snapshot is still incomplete — missing: $still
+  Cache: $(hf_cache_path "$repo")
+  Try:   agent-model pull $name --force
+  If it persists, delete that directory and pull again."
+  fi
+  echo "verified complete"
 
   # Tell them now, not at first request. An unsupported architecture otherwise
   # surfaces as a silent timeout minutes later.
-  local arch status
+  #
+  # The check asks "does mlx_lm implement this model_type", so it only speaks
+  # for the mlx-lm runtime. Under rmlx it would be answering a question nobody
+  # asked — rmlx has its own coverage and serves families mlx-lm cannot — so
+  # skip it rather than print a reassurance about the wrong engine.
+  local rt arch status
+  rt="$(server_runtime)"
+  if [[ "$rt" == "rmlx" ]]; then
+    echo "architecture check skipped: runtime is rmlx, which has its own coverage"
+    echo "cached. Load it with: agent-model use $name && agent-serve restart"
+    return 0
+  fi
+
   arch="$(model_arch_check "$py" "$repo")"
   status="${arch##* }"; arch="${arch%% *}"
   case "$status" in
-    ok)          echo "architecture '$arch' is supported by this mlx-lm" ;;
+    ok)          echo "architecture '$arch' is supported by this mlx-lm (the active runtime)" ;;
     unsupported) echo
                  echo "WARNING: downloaded, but this mlx-lm cannot load it." >&2
                  echo "  config.json says model_type '$arch' and there is no" >&2
